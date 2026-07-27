@@ -28,6 +28,8 @@ trollvncserver_FILES += src/ClipboardManager.mm
 trollvncserver_FILES += src/ScreenCapturer.mm
 trollvncserver_FILES += src/STHIDEventGenerator.mm
 trollvncserver_FILES += src/OhMyJetsam.mm
+trollvncserver_FILES += src/LuaAutomationServer.mm
+trollvncserver_FILES += $(filter-out vendor/lua53/lua.c vendor/lua53/luac.c,$(wildcard vendor/lua53/*.c))
 
 trollvncserver_CFLAGS += -fobjc-arc
 trollvncserver_CFLAGS += -Wno-unknown-warning-option
@@ -49,6 +51,8 @@ trollvncserver_CFLAGS += -DTHEBOOTSTRAP=1
 endif
 
 trollvncserver_CFLAGS += -Iinclude-spi
+trollvncserver_CFLAGS += -Ivendor/lua53
+trollvncserver_CFLAGS += -DLUA_USE_POSIX
 ifeq ($(THEOS_DEVICE_SIMULATOR),1)
 trollvncserver_CFLAGS += -Iinclude-simulator
 trollvncserver_LDFLAGS += -Llib-simulator

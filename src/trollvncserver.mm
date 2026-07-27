@@ -51,6 +51,7 @@
 #import "PSAssistiveTouchSettingsDetail.h"
 #import "STHIDEventGenerator.h"
 #import "ScreenCapturer.h"
+#import "LuaAutomationServer.h"
 
 #define LocalizedString(key, comment, bundle, table)                                                                   \
     (NSLocalizedStringFromTableInBundle((key), (table), (bundle), (comment)) ?: (key))
@@ -5145,6 +5146,7 @@ int main(int argc, const char *argv[]) {
         installTerminationHandlers();
 
         tvStartControlSocketIfNeeded();
+        TVStartLuaAutomationServer(46952);
     }
 
     CFRunLoopRun();
