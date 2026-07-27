@@ -36,11 +36,14 @@
 #import <pthread.h>
 #import <rfb/keysym.h>
 #import <rfb/rfb.h>
+#import <chrono>
+#import <mutex>
 #import <string>
 #import <sys/socket.h>
 #import <sys/sysctl.h>
 #import <unistd.h>
 #import <vector>
+#import <thread>
 
 #import "BulletinManager.h"
 #import "ClipboardManager.h"
@@ -1552,6 +1555,11 @@ static void parseCLI(int argc, const char *argv[]) {
 
 static rfbScreenInfoPtr gScreen = NULL;
 static void (^gFrameHandler)(CMSampleBufferRef) = nil;
+static BOOL gIsCaptureStarted = NO;
+static int gClientCount = 0;
+static std::atomic_uint64_t gCapturedFrameGeneration{0};
+static std::atomic_bool gSnapshotRequestActive{false};
+static std::mutex gSnapshotRequestMutex;
 
 static int gWidth = 0;
 static int gHeight = 0;
@@ -1598,6 +1606,50 @@ NSData *TVCreateLatestFrameJPEG(CGFloat quality) {
     UIImage *image = TVCreateLatestFrameImage();
     if (!image) return nil;
     return UIImageJPEGRepresentation(image, MAX(0.1, MIN(1.0, quality)));
+}
+
+NSData *TVCreateFreshFrameJPEG(CGFloat quality, NSTimeInterval timeout) {
+    std::lock_guard<std::mutex> requestLock(gSnapshotRequestMutex);
+    gSnapshotRequestActive.store(true, std::memory_order_release);
+    uint64_t baseline = gCapturedFrameGeneration.load(std::memory_order_acquire);
+
+    void (^startOrRefreshCapture)(void) = ^{
+        if (!gIsCaptureStarted && gFrameHandler) {
+            gIsCaptureStarted = YES;
+            [[ScreenCapturer sharedCapturer] startCaptureWithFrameHandler:gFrameHandler];
+            TVLog(@"Screen capture started for HTTP snapshot.");
+        }
+        [[ScreenCapturer sharedCapturer] forceNextFrameUpdate];
+    };
+    if ([NSThread isMainThread])
+        startOrRefreshCapture();
+    else
+        dispatch_sync(dispatch_get_main_queue(), startOrRefreshCapture);
+
+    NSTimeInterval boundedTimeout = MAX(0.2, MIN(3.0, timeout));
+    auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds((int)(boundedTimeout * 1000.0));
+    while (gCapturedFrameGeneration.load(std::memory_order_acquire) <= baseline &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    BOOL fresh = gCapturedFrameGeneration.load(std::memory_order_acquire) > baseline;
+    void (^stopSnapshotCapture)(void) = ^{
+        if (gClientCount == 0 && gIsCaptureStarted) {
+            [[ScreenCapturer sharedCapturer] endCapture];
+            gIsCaptureStarted = NO;
+            TVLog(@"HTTP snapshot completed; screen capture stopped.");
+        }
+    };
+    if ([NSThread isMainThread])
+        stopSnapshotCapture();
+    else
+        dispatch_sync(dispatch_get_main_queue(), stopSnapshotCapture);
+
+    NSData *jpeg = fresh ? TVCreateLatestFrameJPEG(quality) : nil;
+    gSnapshotRequestActive.store(false, std::memory_order_release);
+    return jpeg;
 }
 
 // Hash algorithm selection (auto: prefer CRC32 on ARM with hardware support)
@@ -2587,6 +2639,7 @@ static void handleFramebuffer(CMSampleBufferRef sampleBuffer) {
                      (__tv_tEnd - __tv_tStart) * 1000.0);
 #endif
 
+        gCapturedFrameGeneration.fetch_add(1, std::memory_order_release);
         return;
     }
 
@@ -2644,6 +2697,7 @@ static void handleFramebuffer(CMSampleBufferRef sampleBuffer) {
             rotQ, __tv_msLock, __tv_msResize, __tv_msRotate, __tv_msScaleOrCopy, (__tv_tEnd - __tv_tStart) * 1000.0);
 #endif
 
+        gCapturedFrameGeneration.fetch_add(1, std::memory_order_release);
         return;
     }
 
@@ -2898,6 +2952,7 @@ static void handleFramebuffer(CMSampleBufferRef sampleBuffer) {
                  (__tv_tEnd - __tv_tStart) * 1000.0, rectCount, changedPct, fullScreen ? @"YES" : @"NO",
                  gInflight.load(std::memory_order_relaxed), gMaxInflightUpdates);
 #endif
+    gCapturedFrameGeneration.fetch_add(1, std::memory_order_release);
 }
 
 #pragma mark - Event Handlers
@@ -3506,9 +3561,6 @@ static void startBonjour(void) {
 static int gTvCtlListenFd = -1;
 static dispatch_source_t gTvCtlAcceptSource = NULL;
 
-// Number of connected clients
-static int gClientCount = 0;
-
 // Subscribers for control change notifications (store as NSNumber wrapping fd)
 static NSMutableSet<NSNumber *> *gTvCtlSubscribers = nil;
 static dispatch_source_t gTvCtlDebounceTimer = NULL; // debounce timer for change notifications
@@ -4058,7 +4110,6 @@ static void tvPublishClientDisconnectedNotif(NSString *host) {
 
 #pragma mark - Client Handlers
 
-static BOOL gIsCaptureStarted = NO;
 static BOOL gIsClipboardStarted = NO;
 
 #if !TARGET_OS_SIMULATOR
@@ -4095,7 +4146,8 @@ static void clientGoneHook(rfbClientPtr cl) {
     NSString *host = (cl && cl->host) ? [NSString stringWithUTF8String:cl->host] : @"";
     TVLog(@"Client %@ disconnected, active clients=%d", host, gClientCount);
 
-    if (gIsCaptureStarted && gClientCount == 0) {
+    if (gIsCaptureStarted && gClientCount == 0 &&
+        !gSnapshotRequestActive.load(std::memory_order_acquire)) {
         [[ScreenCapturer sharedCapturer] endCapture];
         gIsCaptureStarted = NO;
         TVLog(@"No clients remaining; screen capture stopped.");

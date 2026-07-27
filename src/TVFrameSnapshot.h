@@ -17,4 +17,8 @@ UIImage *_Nullable TVCreateLatestFrameImage(void);
 /// Returns the latest framebuffer encoded as JPEG.
 NSData *_Nullable TVCreateLatestFrameJPEG(CGFloat quality);
 
+/// Starts capture on demand, waits for a fresh frame, and returns it as JPEG.
+/// When there are no VNC clients, capture is stopped again before returning.
+NSData *_Nullable TVCreateFreshFrameJPEG(CGFloat quality, NSTimeInterval timeout);
+
 NS_ASSUME_NONNULL_END

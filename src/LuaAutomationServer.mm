@@ -731,7 +731,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 0.3\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 0.4\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -751,12 +751,12 @@ static void HandleClient(int fd, uint16_t port) {
     if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 0.3\"}";
+            ",\"version\":\"LuaAgent 0.4\"}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
     } else if (path == "/snapshot") {
-        NSData *jpeg = TVCreateLatestFrameJPEG(0.80);
+        NSData *jpeg = TVCreateFreshFrameJPEG(0.80, 2.0);
         if (!jpeg) {
             SendResponse(fd, 400, ApiJson(503, "Screen frame is not ready"));
         } else {
@@ -838,10 +838,69 @@ static void RunServer(uint16_t port) {
     }
 }
 
+static std::string DiscoveryJson(uint16_t apiPort) {
+    UIDevice *device = UIDevice.currentDevice;
+    std::string name = device.name.UTF8String ?: "iPhone";
+    std::string model = device.model.UTF8String ?: "iPhone";
+    std::string version = device.systemVersion.UTF8String ?: "";
+    return "{\"port\":" + std::to_string(apiPort) +
+        ",\"devname\":\"" + JsonEscape(name) +
+        "\",\"marketing_name\":\"" + JsonEscape(model) +
+        "\",\"sysversion\":\"" + JsonEscape(version) +
+        "\",\"tsversion\":\"LuaAgent 0.4\"}";
+}
+
+static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
+    @autoreleasepool {
+        int server = socket(AF_INET, SOCK_DGRAM, 0);
+        if (server < 0) return;
+        int yes = 1;
+        setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_ANY);
+        address.sin_port = htons(discoveryPort);
+        if (bind(server, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
+            NSLog(@"[LuaAgent] cannot listen for discovery on UDP %u: %s",
+                  discoveryPort, strerror(errno));
+            close(server);
+            return;
+        }
+        NSLog(@"[LuaAgent] discovery listening on UDP 0.0.0.0:%u", discoveryPort);
+        for (;;) {
+            uint8_t requestBytes[1024];
+            sockaddr_in sender{};
+            socklen_t senderLength = sizeof(sender);
+            ssize_t length = recvfrom(
+                server, requestBytes, sizeof(requestBytes), 0,
+                reinterpret_cast<sockaddr *>(&sender), &senderLength);
+            if (length <= 0) continue;
+
+            @autoreleasepool {
+                NSData *requestData = [NSData dataWithBytes:requestBytes
+                                                    length:(NSUInteger)length];
+                NSError *jsonError = nil;
+                id object = [NSJSONSerialization JSONObjectWithData:requestData
+                                                            options:0
+                                                              error:&jsonError];
+                if (jsonError || ![object isKindOfClass:[NSDictionary class]] ||
+                    ![(NSDictionary *)object objectForKey:@"port"]) {
+                    continue;
+                }
+
+                std::string response = DiscoveryJson(apiPort);
+                sendto(server, response.data(), response.size(), 0,
+                       reinterpret_cast<sockaddr *>(&sender), senderLength);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 void TVStartLuaAutomationServer(uint16_t port) {
     bool expected = false;
     if (!gStarted.compare_exchange_strong(expected, true)) return;
     std::thread([port] { RunServer(port); }).detach();
+    std::thread([port] { RunDiscovery(46953, port); }).detach();
 }
