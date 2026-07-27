@@ -278,11 +278,19 @@ static int LuaScreenFindImage(lua_State *L) {
     NSString *path = [[NSString stringWithUTF8String:pathCString] stringByExpandingTildeInPath];
     UIImage *needleImage = [UIImage imageWithContentsOfFile:path];
     int screenWidth = 0, screenHeight = 0;
-    NSData *screen = TVCopyLatestFrameBGRA(&screenWidth, &screenHeight);
+    // Work from an immutable, freshly captured JPEG. Reading gFrontBuffer directly
+    // here raced the capture thread while it resized/swapped buffers and could crash
+    // the daemon during app transitions.
+    NSData *freshJPEG = TVCreateFreshFrameJPEG(0.96, 2.0);
+    UIImage *screenImage = freshJPEG ? [UIImage imageWithData:freshJPEG] : nil;
+    NSData *screen =
+        screenImage ? CopyImageBGRA(screenImage, &screenWidth, &screenHeight) : nil;
     int needleWidth = 0, needleHeight = 0;
     NSData *needle = needleImage ? CopyImageBGRA(needleImage, &needleWidth, &needleHeight) : nil;
     if (!screen || !needle || needleWidth <= 0 || needleHeight <= 0 ||
-        needleWidth > screenWidth || needleHeight > screenHeight) {
+        needleWidth > screenWidth || needleHeight > screenHeight ||
+        screen.length < (size_t)screenWidth * screenHeight * 4 ||
+        needle.length < (size_t)needleWidth * needleHeight * 4) {
         lua_pushinteger(L, -1);
         lua_pushinteger(L, -1);
         return 2;
@@ -766,7 +774,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 0.5\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 0.6\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -786,7 +794,7 @@ static void HandleClient(int fd, uint16_t port) {
     if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 0.5\"}";
+            ",\"version\":\"LuaAgent 0.6\"}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
@@ -882,7 +890,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 0.5\"}";
+        "\",\"tsversion\":\"LuaAgent 0.6\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
