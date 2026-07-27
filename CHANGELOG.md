@@ -2,6 +2,12 @@
 
 All notable changes to TrollVNC are documented here.
 
+# 3.4-279
+
+- Carry Lua run and health commands over the persistent outbound presence
+  connection when iOS power saving blocks new inbound HTTP connections.
+- Keep wake and automation available without lighting the display periodically.
+
 # 3.4-278
 
 - Add a persistent two-way TCP presence channel to the Windows Controller.
