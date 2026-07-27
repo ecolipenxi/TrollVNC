@@ -17,12 +17,15 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <arpa/inet.h>
+#include <mach/mach.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -56,12 +59,16 @@ std::atomic_bool gRunning{false};
 std::atomic_bool gCancel{false};
 std::atomic_int gActiveClients{0};
 std::mutex gScriptMutex;
+std::mutex gSpawnMutex;
 std::thread gScriptThread;
 std::mutex gStatusMutex;
 std::string gLastError;
+std::string gRunId;
+std::vector<std::pair<std::string, std::string>> gRecentRequests;
 std::vector<std::string> gRecentLogs;
 double gStartedAt = 0;
 double gFinishedAt = 0;
+bool gStoppedByUser = false;
 
 static std::string JsonEscape(const std::string &value) {
     std::string out;
@@ -86,6 +93,78 @@ static std::string JsonEscape(const std::string &value) {
         }
     }
     return out;
+}
+
+struct SpringBoardScreenApi {
+    mach_port_t (*serverPort)(void) = nullptr;
+    void (*lockStatus)(mach_port_t, Boolean *, Boolean *) = nullptr;
+    void (*undim)(void) = nullptr;
+    void (*lockDevice)(void) = nullptr;
+};
+
+static SpringBoardScreenApi &ScreenApi() {
+    static SpringBoardScreenApi api;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        void *handle = dlopen(
+            "/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+            RTLD_LAZY | RTLD_LOCAL);
+        if (!handle) return;
+        api.serverPort = reinterpret_cast<mach_port_t (*)(void)>(
+            dlsym(handle, "SBSSpringBoardServerPort"));
+        api.lockStatus = reinterpret_cast<void (*)(mach_port_t, Boolean *, Boolean *)>(
+            dlsym(handle, "SBGetScreenLockStatus"));
+        api.undim = reinterpret_cast<void (*)(void)>(dlsym(handle, "SBSUndimScreen"));
+        api.lockDevice = reinterpret_cast<void (*)(void)>(dlsym(handle, "SBSLockDevice"));
+    });
+    return api;
+}
+
+static bool ReadScreenOn(bool &screenOn) {
+    auto &api = ScreenApi();
+    if (!api.serverPort || !api.lockStatus) return false;
+    Boolean locked = false;
+    Boolean passcode = false;
+    api.lockStatus(api.serverPort(), &locked, &passcode);
+    screenOn = !locked;
+    return true;
+}
+
+static int LuaDeviceIsScreenOn(lua_State *L) {
+    bool screenOn = false;
+    if (!ReadScreenOn(screenOn)) {
+        lua_pushnil(L);
+        lua_pushstring(L, "screen state API unavailable");
+        return 2;
+    }
+    lua_pushboolean(L, screenOn);
+    return 1;
+}
+
+static int LuaDeviceWake(lua_State *L) {
+    bool screenOn = false;
+    if (ReadScreenOn(screenOn) && screenOn) {
+        lua_pushboolean(L, true);
+        return 1;
+    }
+    auto &api = ScreenApi();
+    if (api.undim) api.undim();
+    else [STHIDEventGenerator.sharedGenerator powerPress];
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+static int LuaDeviceSleep(lua_State *L) {
+    bool screenOn = true;
+    if (ReadScreenOn(screenOn) && !screenOn) {
+        lua_pushboolean(L, true);
+        return 1;
+    }
+    auto &api = ScreenApi();
+    if (api.lockDevice) api.lockDevice();
+    else [STHIDEventGenerator.sharedGenerator powerPress];
+    lua_pushboolean(L, true);
+    return 1;
 }
 
 static std::string ApiJson(int code, const std::string &message, const std::string &data = "{}") {
@@ -425,6 +504,15 @@ static void RegisterFunctions(lua_State *L) {
     lua_setfield(L, -2, "run");
     lua_setglobal(L, "app");
 
+    lua_newtable(L);
+    lua_pushcfunction(L, LuaDeviceIsScreenOn);
+    lua_setfield(L, -2, "is_screen_on");
+    lua_pushcfunction(L, LuaDeviceWake);
+    lua_setfield(L, -2, "wake");
+    lua_pushcfunction(L, LuaDeviceSleep);
+    lua_setfield(L, -2, "sleep");
+    lua_setglobal(L, "device");
+
     lua_pushcfunction(L, LuaScreenGetColor);
     lua_setglobal(L, "getColor");
     lua_pushcfunction(L, LuaScreenFindImage);
@@ -447,20 +535,42 @@ static void StopScript() {
     if (gScriptThread.joinable()) gScriptThread.join();
     gRunning.store(false);
     std::lock_guard<std::mutex> statusLock(gStatusMutex);
+    gStoppedByUser = true;
     gFinishedAt = [[NSDate date] timeIntervalSince1970];
 }
 
-static void StartScript(const std::string &script) {
+struct StartResult {
+    std::string runId;
+    bool duplicate;
+};
+
+static StartResult StartScript(
+    const std::string &script, const std::string &requestId) {
+    std::lock_guard<std::mutex> spawnLock(gSpawnMutex);
+    if (!requestId.empty()) {
+        std::lock_guard<std::mutex> statusLock(gStatusMutex);
+        for (const auto &entry : gRecentRequests) {
+            if (entry.first == requestId) return {entry.second, true};
+        }
+    }
     StopScript();
     std::lock_guard<std::mutex> lock(gScriptMutex);
     gCancel.store(false);
     gRunning.store(true);
+    std::string runId = NSUUID.UUID.UUIDString.UTF8String ?: "";
     {
         std::lock_guard<std::mutex> statusLock(gStatusMutex);
+        gRunId = runId;
         gLastError.clear();
         gRecentLogs.clear();
+        gStoppedByUser = false;
         gStartedAt = [[NSDate date] timeIntervalSince1970];
         gFinishedAt = 0;
+        if (!requestId.empty()) {
+            gRecentRequests.emplace_back(requestId, runId);
+            if (gRecentRequests.size() > 100)
+                gRecentRequests.erase(gRecentRequests.begin());
+        }
     }
     gScriptThread = std::thread([script] {
         @autoreleasepool {
@@ -486,6 +596,7 @@ static void StartScript(const std::string &script) {
             gFinishedAt = [[NSDate date] timeIntervalSince1970];
         }
     });
+    return {runId, false};
 }
 
 struct HttpRequest {
@@ -493,6 +604,17 @@ struct HttpRequest {
     std::string path;
     std::string body;
 };
+
+static std::string QueryValue(const std::string &target, const std::string &name) {
+    size_t query = target.find('?');
+    if (query == std::string::npos) return "";
+    std::string key = name + "=";
+    size_t begin = target.find(key, query + 1);
+    if (begin == std::string::npos) return "";
+    begin += key.size();
+    size_t end = target.find('&', begin);
+    return target.substr(begin, end == std::string::npos ? end : end - begin);
+}
 
 static bool ReceiveRequest(int fd, HttpRequest &request) {
     std::string bytes;
@@ -573,6 +695,8 @@ static std::string StatusDataJson() {
     }
     logs += "]";
     return "{\"running\":" + std::string(gRunning.load() ? "true" : "false") +
+        ",\"run_id\":\"" + JsonEscape(gRunId) +
+        "\",\"stopped_by_user\":" + (gStoppedByUser ? "true" : "false") +
         ",\"last_error\":\"" + JsonEscape(gLastError) +
         "\",\"started_at\":" + std::to_string(gStartedAt) +
         ",\"finished_at\":" + std::to_string(gFinishedAt) +
@@ -584,15 +708,27 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string name = device.name.UTF8String ?: "iPhone";
     std::string version = device.systemVersion.UTF8String ?: "";
     std::string lastError;
+    std::string runId;
+    double startedAt;
+    double finishedAt;
+    bool stoppedByUser;
     {
         std::lock_guard<std::mutex> lock(gStatusMutex);
         lastError = gLastError;
+        runId = gRunId;
+        startedAt = gStartedAt;
+        finishedAt = gFinishedAt;
+        stoppedByUser = gStoppedByUser;
     }
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 0.2\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 0.3\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
+        ",\"run_id\":\"" + JsonEscape(runId) +
+        "\",\"started_at\":" + std::to_string(startedAt) +
+        ",\"finished_at\":" + std::to_string(finishedAt) +
+        ",\"stopped_by_user\":" + (stoppedByUser ? "true" : "false") +
         ",\"last_error\":\"" + JsonEscape(lastError) + "\"}";
     return ApiJson(0, "Operation succeed", data);
 }
@@ -607,7 +743,7 @@ static void HandleClient(int fd, uint16_t port) {
     if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 0.2\"}";
+            ",\"version\":\"LuaAgent 0.3\"}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
@@ -632,8 +768,13 @@ static void HandleClient(int fd, uint16_t port) {
         if (!error.empty()) {
             SendResponse(fd, 200, ApiJson(1, error));
         } else {
-            StartScript(request.body);
-            SendResponse(fd, 200, ApiJson(0, "Operation succeed"));
+            StartResult result = StartScript(
+                request.body, QueryValue(request.path, "request_id"));
+            std::string data = "{\"run_id\":\"" + JsonEscape(result.runId) +
+                "\",\"duplicate\":" + (result.duplicate ? "true" : "false") + "}";
+            SendResponse(fd, 200, ApiJson(
+                0, result.duplicate ? "Duplicate request ignored" : "Operation succeed",
+                data));
         }
     } else if (path == "/recycle") {
         StopScript();
