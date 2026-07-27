@@ -54,6 +54,7 @@ struct TouchGesture {
 std::atomic_bool gStarted{false};
 std::atomic_bool gRunning{false};
 std::atomic_bool gCancel{false};
+std::atomic_int gActiveClients{0};
 std::mutex gScriptMutex;
 std::thread gScriptThread;
 std::mutex gStatusMutex;
@@ -603,7 +604,12 @@ static void HandleClient(int fd, uint16_t port) {
         return;
     }
     std::string path = request.path.substr(0, request.path.find('?'));
-    if (path == "/deviceinfo") {
+    if (path == "/health") {
+        std::string data = "{\"ok\":true,\"running\":" +
+            std::string(gRunning.load() ? "true" : "false") +
+            ",\"version\":\"LuaAgent 0.2\"}";
+        SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
+    } else if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
     } else if (path == "/snapshot") {
         NSData *jpeg = TVCreateLatestFrameJPEG(0.80);
@@ -649,7 +655,7 @@ static void RunServer(uint16_t port) {
         address.sin_addr.s_addr = htonl(INADDR_ANY);
         address.sin_port = htons(port);
         if (bind(server, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
-            listen(server, 16) != 0) {
+            listen(server, 64) != 0) {
             NSLog(@"[LuaAgent] cannot listen on %u: %s", port, strerror(errno));
             close(server);
             return;
@@ -658,10 +664,25 @@ static void RunServer(uint16_t port) {
         for (;;) {
             int client = accept(server, nullptr, nullptr);
             if (client < 0) continue;
+            if (gActiveClients.fetch_add(1) >= 32) {
+                gActiveClients.fetch_sub(1);
+                SendResponse(client, 503, ApiJson(503, "Server busy"));
+                close(client);
+                continue;
+            }
+            timeval timeout{};
+            timeout.tv_sec = 12;
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            setsockopt(client, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+#ifdef SO_NOSIGPIPE
+            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+#endif
             std::thread([client, port] {
                 @autoreleasepool {
                     HandleClient(client, port);
                     close(client);
+                    gActiveClients.fetch_sub(1);
                 }
             }).detach();
         }
