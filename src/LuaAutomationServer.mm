@@ -69,6 +69,39 @@ std::vector<std::string> gRecentLogs;
 double gStartedAt = 0;
 double gFinishedAt = 0;
 bool gStoppedByUser = false;
+std::mutex gKeepAliveMutex;
+sockaddr_in gKeepAliveTarget{};
+bool gHasKeepAliveTarget = false;
+
+static void RememberControllerAddress(const sockaddr_in &peer) {
+    if (peer.sin_family != AF_INET || peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK)) return;
+    std::lock_guard<std::mutex> lock(gKeepAliveMutex);
+    gKeepAliveTarget = peer;
+    gKeepAliveTarget.sin_port = htons(46954);
+    gHasKeepAliveTarget = true;
+}
+
+static void RunControllerKeepAlive() {
+    @autoreleasepool {
+        int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) return;
+        const char payload[] = "LUAAGENT_KEEPALIVE_V1";
+        for (;;) {
+            sockaddr_in target{};
+            bool hasTarget = false;
+            {
+                std::lock_guard<std::mutex> lock(gKeepAliveMutex);
+                hasTarget = gHasKeepAliveTarget;
+                if (hasTarget) target = gKeepAliveTarget;
+            }
+            if (hasTarget) {
+                sendto(fd, payload, sizeof(payload) - 1, 0,
+                       reinterpret_cast<sockaddr *>(&target), sizeof(target));
+            }
+            usleep(5 * 1000 * 1000);
+        }
+    }
+}
 
 static std::string JsonEscape(const std::string &value) {
     std::string out;
@@ -142,35 +175,25 @@ static int LuaDeviceIsScreenOn(lua_State *L) {
 }
 
 static int LuaDeviceWake(lua_State *L) {
-    bool screenOn = false;
-    if (ReadScreenOn(screenOn) && screenOn) {
-        lua_pushboolean(L, true);
-        return 1;
-    }
     auto &api = ScreenApi();
     if (!api.undim) {
         lua_pushnil(L);
         lua_pushstring(L, "safe wake API unavailable");
         return 2;
     }
+    // SBGetScreenLockStatus reports lock/passcode state, not whether the panel
+    // is illuminated. On passcode-free devices it can remain "unlocked" after
+    // the display sleeps, so never use it to skip the undim request.
     api.undim();
     lua_pushboolean(L, true);
     return 1;
 }
 
 static int LuaDeviceSleep(lua_State *L) {
-    bool screenOn = true;
-    if (ReadScreenOn(screenOn) && !screenOn) {
-        lua_pushboolean(L, true);
-        return 1;
-    }
-    auto &api = ScreenApi();
-    if (!api.lockDevice) {
-        lua_pushnil(L);
-        lua_pushstring(L, "safe sleep API unavailable");
-        return 2;
-    }
-    api.lockDevice();
+    // SBSLockDevice can update SpringBoard's lock state without powering off
+    // the panel on passcode-free iOS 15 devices. A HID power press matches the
+    // physical side button and reliably turns off an illuminated display.
+    [STHIDEventGenerator.sharedGenerator powerPress];
     lua_pushboolean(L, true);
     return 1;
 }
@@ -774,7 +797,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 0.6\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 0.7\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -794,7 +817,7 @@ static void HandleClient(int fd, uint16_t port) {
     if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 0.6\"}";
+            ",\"version\":\"LuaAgent 0.7\"}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
@@ -854,8 +877,12 @@ static void RunServer(uint16_t port) {
         }
         NSLog(@"[LuaAgent] listening on 0.0.0.0:%u", port);
         for (;;) {
-            int client = accept(server, nullptr, nullptr);
+            sockaddr_in peer{};
+            socklen_t peerLength = sizeof(peer);
+            int client = accept(
+                server, reinterpret_cast<sockaddr *>(&peer), &peerLength);
             if (client < 0) continue;
+            RememberControllerAddress(peer);
             if (gActiveClients.fetch_add(1) >= 32) {
                 gActiveClients.fetch_sub(1);
                 SendResponse(client, 503, ApiJson(503, "Server busy"));
@@ -890,7 +917,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 0.6\"}";
+        "\",\"tsversion\":\"LuaAgent 0.7\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
@@ -946,4 +973,5 @@ void TVStartLuaAutomationServer(uint16_t port) {
     if (!gStarted.compare_exchange_strong(expected, true)) return;
     std::thread([port] { RunServer(port); }).detach();
     std::thread([port] { RunDiscovery(46953, port); }).detach();
+    std::thread([] { RunControllerKeepAlive(); }).detach();
 }

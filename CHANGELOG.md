@@ -18,6 +18,13 @@ All notable changes to TrollVNC are documented here.
 - Fixed a short-read bug in `TVNCReadAll`: data is now read until EOF or timeout instead of stopping early on a partial buffer.
 - Fixed subscription handshake validation: the server response is now checked to contain “OK” before the client list is considered live; an invalid response triggers an immediate reconnect.
 - Fixed `TVNCSliderCell` reuse bugs: `prepareForReuse` resets the slider to `minimumValue`, and `refreshCellContentsWithSpecifier:` fully re-applies `min`/`max`/`format`/`isContinuous` from the incoming specifier.
+# 3.3-276
+
+- Keep the iPhone network route alive with an outbound UDP heartbeat every 5 seconds.
+- Remember the latest Windows Controller address and receive an acknowledgement on UDP 46954.
+- Always execute screen wake instead of trusting the lock-state API as display-power state.
+- Use a real HID Power event for `device.sleep()` on passcode-free iOS 15 devices.
+
 # 3.2-275
 
 - Fix a daemon crash in `screen.find_image` by matching against a fresh immutable
