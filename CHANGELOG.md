@@ -2,6 +2,12 @@
 
 All notable changes to TrollVNC are documented here.
 
+# 3.4-280
+
+- Drain interleaved presence commands until the matching heartbeat ACK arrives.
+- Prevent queued ACK packets from starving later Lua commands and causing false
+  background-channel timeout errors.
+
 # 3.4-279
 
 - Carry Lua run and health commands over the persistent outbound presence

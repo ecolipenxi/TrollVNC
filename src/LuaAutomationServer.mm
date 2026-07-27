@@ -739,7 +739,7 @@ static std::string RunPresenceCommand(const std::string &line) {
         if (requestId.empty()) return "";
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.0\"}";
+            ",\"version\":\"LuaAgent 1.1\"}";
         std::string response = ApiJson(0, "Operation succeed", data);
         return "RESULT " + requestId + " " + EncodeBase64(response) + "\n";
     }
@@ -809,13 +809,22 @@ static void RunControllerPresence() {
             std::string pending;
             for (;;) {
                 if (!SendAll(fd, heartbeat, sizeof(heartbeat) - 1)) break;
-                std::string line;
-                if (!ReceiveLine(fd, pending, line)) break;
-                std::string result = RunPresenceCommand(line);
-                if (!result.empty() &&
-                    !SendAll(fd, result.data(), result.size())) break;
+                bool acknowledged = false;
+                while (!acknowledged) {
+                    std::string line;
+                    if (!ReceiveLine(fd, pending, line)) goto disconnected;
+                    if (line == "CONTROLLER_ACK_V1") {
+                        acknowledged = true;
+                        continue;
+                    }
+                    std::string result = RunPresenceCommand(line);
+                    if (!result.empty() &&
+                        !SendAll(fd, result.data(), result.size()))
+                        goto disconnected;
+                }
                 usleep(2 * 1000 * 1000);
             }
+disconnected:
             close(fd);
             usleep(1000 * 1000);
         }
@@ -946,7 +955,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.0\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 1.1\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -1004,7 +1013,7 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
     if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.0\"}";
+            ",\"version\":\"LuaAgent 1.1\"}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
@@ -1114,7 +1123,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.0\"}";
+        "\",\"tsversion\":\"LuaAgent 1.1\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
