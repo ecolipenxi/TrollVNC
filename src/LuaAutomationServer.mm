@@ -378,6 +378,39 @@ static int LuaAppRun(lua_State *L) {
     return 1;
 }
 
+static int LuaAppRunShortcut(lua_State *L) {
+    const char *nameCString = luaL_checkstring(L, 1);
+    NSString *shortcutName = [NSString stringWithUTF8String:nameCString];
+    if (shortcutName.length == 0) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "shortcut name is empty");
+        return 2;
+    }
+
+    NSURLComponents *components = [[NSURLComponents alloc] init];
+    components.scheme = @"shortcuts";
+    components.host = @"run-shortcut";
+    components.queryItems = @[
+        [NSURLQueryItem queryItemWithName:@"name" value:shortcutName],
+    ];
+    NSURL *url = components.URL;
+    if (!url) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "failed to create shortcut URL");
+        return 2;
+    }
+
+    int result = SBSLaunchApplicationWithIdentifierAndURLAndLaunchOptions(
+        CFSTR("com.apple.shortcuts"), (__bridge CFURLRef)url, NULL,
+        (__bridge CFDictionaryRef)@{SBSApplicationLaunchOptionUnlockDeviceKey : @YES}, NO);
+    lua_pushboolean(L, result == 0);
+    if (result != 0) {
+        lua_pushfstring(L, "shortcut launch failed with code %d", result);
+        return 2;
+    }
+    return 1;
+}
+
 static int LuaKeyPress(lua_State *L) {
     const char *key = luaL_checkstring(L, 1);
     NSString *name = [[NSString stringWithUTF8String:key] uppercaseString];
@@ -510,6 +543,8 @@ static void RegisterFunctions(lua_State *L) {
     lua_newtable(L);
     lua_pushcfunction(L, LuaAppRun);
     lua_setfield(L, -2, "run");
+    lua_pushcfunction(L, LuaAppRunShortcut);
+    lua_setfield(L, -2, "run_shortcut");
     lua_setglobal(L, "app");
 
     lua_newtable(L);
@@ -731,7 +766,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 0.4\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 0.5\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -751,7 +786,7 @@ static void HandleClient(int fd, uint16_t port) {
     if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 0.4\"}";
+            ",\"version\":\"LuaAgent 0.5\"}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
@@ -847,7 +882,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 0.4\"}";
+        "\",\"tsversion\":\"LuaAgent 0.5\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {

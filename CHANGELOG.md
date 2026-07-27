@@ -18,6 +18,11 @@ All notable changes to TrollVNC are documented here.
 - Fixed a short-read bug in `TVNCReadAll`: data is now read until EOF or timeout instead of stopping early on a partial buffer.
 - Fixed subscription handshake validation: the server response is now checked to contain “OK” before the client list is considered live; an invalid response triggers an immediate reconnect.
 - Fixed `TVNCSliderCell` reuse bugs: `prepareForReuse` resets the slider to `minimumValue`, and `refreshCellContentsWithSpecifier:` fully re-applies `min`/`max`/`format`/`isContinuous` from the incoming specifier.
+# 3.2-274
+
+- Add `app.run_shortcut(name)` to run an Apple Shortcut by its exact name without
+  relying on its grid position.
+
 # 3.2-273
 
 - Add UDP discovery on port 46953 for XXTouch Controller auto scan.
