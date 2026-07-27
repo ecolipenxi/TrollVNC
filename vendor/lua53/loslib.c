@@ -140,6 +140,13 @@ static time_t l_checktime (lua_State *L, int arg) {
 
 static int os_execute (lua_State *L) {
   const char *cmd = luaL_optstring(L, 1, NULL);
+#if defined(__APPLE__) && defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__)
+  if (cmd == NULL) {
+    lua_pushboolean(L, 0);  /* iOS does not expose a system shell */
+    return 1;
+  }
+  return luaL_error(L, "os.execute is unavailable on iOS");
+#else
   int stat = system(cmd);
   if (cmd != NULL)
     return luaL_execresult(L, stat);
@@ -147,6 +154,7 @@ static int os_execute (lua_State *L) {
     lua_pushboolean(L, stat);  /* true if there is a shell */
     return 1;
   }
+#endif
 }
 
 
@@ -406,4 +414,3 @@ LUAMOD_API int luaopen_os (lua_State *L) {
   luaL_newlib(L, syslib);
   return 1;
 }
-
