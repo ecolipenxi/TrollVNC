@@ -591,7 +591,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 0.1\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 0.2\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"last_error\":\"" + JsonEscape(lastError) + "\"}";
     return ApiJson(0, "Operation succeed", data);
