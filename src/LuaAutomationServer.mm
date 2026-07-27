@@ -797,7 +797,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 0.7\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 0.8\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -807,7 +807,45 @@ static std::string DeviceInfoJson(uint16_t port) {
     return ApiJson(0, "Operation succeed", data);
 }
 
-static void HandleClient(int fd, uint16_t port) {
+static std::string LaunchTrollStoreUpdate(
+    const std::string &remoteUrl, const sockaddr_in &peer) {
+    if (remoteUrl.empty() || remoteUrl.size() > 2048)
+        return ApiJson(400, "Invalid update URL");
+
+    NSString *remoteString = [NSString stringWithUTF8String:remoteUrl.c_str()];
+    NSURLComponents *remote = [NSURLComponents componentsWithString:remoteString];
+    NSString *scheme = remote.scheme.lowercaseString;
+    if (!remote.URL || !([scheme isEqualToString:@"http"] ||
+                         [scheme isEqualToString:@"https"])) {
+        return ApiJson(400, "Update URL must use HTTP or HTTPS");
+    }
+
+    char peerText[INET_ADDRSTRLEN] = {};
+    if (!inet_ntop(AF_INET, &peer.sin_addr, peerText, sizeof(peerText)) ||
+        ![remote.host isEqualToString:[NSString stringWithUTF8String:peerText]]) {
+        return ApiJson(403, "Update URL host must match Controller IP");
+    }
+
+    NSURLComponents *install = [[NSURLComponents alloc] init];
+    install.scheme = @"apple-magnifier";
+    install.host = @"install";
+    install.queryItems = @[
+        [NSURLQueryItem queryItemWithName:@"url" value:remote.URL.absoluteString],
+    ];
+    if (!install.URL) return ApiJson(500, "Cannot create TrollStore URL");
+
+    int result = SBSLaunchApplicationWithIdentifierAndURLAndLaunchOptions(
+        CFSTR("com.opa334.TrollStore"), (__bridge CFURLRef)install.URL, NULL,
+        (__bridge CFDictionaryRef)@{
+            SBSApplicationLaunchOptionUnlockDeviceKey : @YES
+        }, NO);
+    if (result != 0) {
+        return ApiJson(500, "Cannot launch TrollStore, code " + std::to_string(result));
+    }
+    return ApiJson(0, "TrollStore update started");
+}
+
+static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
     HttpRequest request;
     if (!ReceiveRequest(fd, request)) {
         SendResponse(fd, 400, ApiJson(400, "Invalid HTTP request"));
@@ -817,7 +855,7 @@ static void HandleClient(int fd, uint16_t port) {
     if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 0.7\"}";
+            ",\"version\":\"LuaAgent 0.8\"}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
@@ -854,6 +892,16 @@ static void HandleClient(int fd, uint16_t port) {
         StopScript();
         [STHIDEventGenerator.sharedGenerator releaseEveryKeys];
         SendResponse(fd, 200, ApiJson(0, "Operation succeed"));
+    } else if (path == "/install_update") {
+        std::string response = LaunchTrollStoreUpdate(request.body, peer);
+        bool ok = response.find("\"code\":0") != std::string::npos;
+        SendResponse(fd, ok ? 200 : 400, response);
+    } else if (path == "/restart_agent") {
+        SendResponse(fd, 200, ApiJson(0, "Agent restart scheduled"));
+        std::thread([] {
+            usleep(750 * 1000);
+            _exit(0);
+        }).detach();
     } else {
         SendResponse(fd, 404, ApiJson(404, "Endpoint not found"));
     }
@@ -897,9 +945,9 @@ static void RunServer(uint16_t port) {
 #ifdef SO_NOSIGPIPE
             setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
 #endif
-            std::thread([client, port] {
+            std::thread([client, port, peer] {
                 @autoreleasepool {
-                    HandleClient(client, port);
+                    HandleClient(client, port, peer);
                     close(client);
                     gActiveClients.fetch_sub(1);
                 }
@@ -917,7 +965,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 0.7\"}";
+        "\",\"tsversion\":\"LuaAgent 0.8\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {

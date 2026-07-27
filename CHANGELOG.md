@@ -18,6 +18,13 @@ All notable changes to TrollVNC are documented here.
 - Fixed a short-read bug in `TVNCReadAll`: data is now read until EOF or timeout instead of stopping early on a partial buffer.
 - Fixed subscription handshake validation: the server response is now checked to contain “OK” before the client list is considered live; an invalid response triggers an immediate reconnect.
 - Fixed `TVNCSliderCell` reuse bugs: `prepareForReuse` resets the slider to `minimumValue`, and `refreshCellContentsWithSpecifier:` fully re-applies `min`/`max`/`format`/`isContinuous` from the incoming specifier.
+# 3.4-277
+
+- Add a LAN-only `/install_update` API for bulk TrollStore updates.
+- Only accept an update URL whose host matches the requesting Controller IP.
+- Launch TrollStore directly with its official `apple-magnifier://install` URL.
+- Add a watchdog-assisted restart API so the newly installed Agent binary becomes active.
+
 # 3.3-276
 
 - Keep the iPhone network route alive with an outbound UDP heartbeat every 5 seconds.
