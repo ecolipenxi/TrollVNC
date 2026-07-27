@@ -85,7 +85,11 @@ static void RunControllerKeepAlive() {
     @autoreleasepool {
         int fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd < 0) return;
+        timeval timeout{};
+        timeout.tv_sec = 1;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         const char payload[] = "LUAAGENT_KEEPALIVE_V1";
+        const char expectedAck[] = "CONTROLLER_ACK_V1";
         for (;;) {
             sockaddr_in target{};
             bool hasTarget = false;
@@ -97,8 +101,85 @@ static void RunControllerKeepAlive() {
             if (hasTarget) {
                 sendto(fd, payload, sizeof(payload) - 1, 0,
                        reinterpret_cast<sockaddr *>(&target), sizeof(target));
+                char ack[64]{};
+                sockaddr_in sender{};
+                socklen_t senderLength = sizeof(sender);
+                ssize_t received = recvfrom(
+                    fd, ack, sizeof(ack), 0,
+                    reinterpret_cast<sockaddr *>(&sender), &senderLength);
+                if (received != static_cast<ssize_t>(sizeof(expectedAck) - 1) ||
+                    std::memcmp(ack, expectedAck, sizeof(expectedAck) - 1) != 0) {
+                    // UDP loss is tolerated; TCP presence below is the primary
+                    // bidirectional screen-off keepalive.
+                }
             }
-            usleep(5 * 1000 * 1000);
+            usleep(2 * 1000 * 1000);
+        }
+    }
+}
+
+static bool SendAll(int fd, const char *data, size_t size) {
+    size_t sent = 0;
+    while (sent < size) {
+        ssize_t count = send(fd, data + sent, size - sent, 0);
+        if (count <= 0) return false;
+        sent += static_cast<size_t>(count);
+    }
+    return true;
+}
+
+static void RunControllerPresence() {
+    @autoreleasepool {
+        const char heartbeat[] = "LUAAGENT_PRESENCE_V1\n";
+        const char expectedAck[] = "CONTROLLER_ACK_V1";
+        for (;;) {
+            sockaddr_in target{};
+            bool hasTarget = false;
+            {
+                std::lock_guard<std::mutex> lock(gKeepAliveMutex);
+                hasTarget = gHasKeepAliveTarget;
+                if (hasTarget) target = gKeepAliveTarget;
+            }
+            if (!hasTarget) {
+                usleep(1000 * 1000);
+                continue;
+            }
+
+            target.sin_port = htons(46955);
+            int fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (fd < 0) {
+                usleep(2 * 1000 * 1000);
+                continue;
+            }
+            int yes = 1;
+            setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+#ifdef SO_NOSIGPIPE
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+#endif
+            timeval timeout{};
+            timeout.tv_sec = 5;
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+            if (connect(fd, reinterpret_cast<sockaddr *>(&target),
+                        sizeof(target)) != 0) {
+                close(fd);
+                usleep(2 * 1000 * 1000);
+                continue;
+            }
+
+            for (;;) {
+                if (!SendAll(fd, heartbeat, sizeof(heartbeat) - 1)) break;
+                char ack[64]{};
+                ssize_t received = recv(fd, ack, sizeof(ack), 0);
+                if (received < static_cast<ssize_t>(sizeof(expectedAck) - 1) ||
+                    std::memcmp(ack, expectedAck, sizeof(expectedAck) - 1) != 0) {
+                    break;
+                }
+                usleep(2 * 1000 * 1000);
+            }
+            close(fd);
+            usleep(1000 * 1000);
         }
     }
 }
@@ -797,7 +878,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 0.8\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 0.9\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -855,7 +936,7 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
     if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 0.8\"}";
+            ",\"version\":\"LuaAgent 0.9\"}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
@@ -965,7 +1046,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 0.8\"}";
+        "\",\"tsversion\":\"LuaAgent 0.9\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
@@ -1022,4 +1103,5 @@ void TVStartLuaAutomationServer(uint16_t port) {
     std::thread([port] { RunServer(port); }).detach();
     std::thread([port] { RunDiscovery(46953, port); }).detach();
     std::thread([] { RunControllerKeepAlive(); }).detach();
+    std::thread([] { RunControllerPresence(); }).detach();
 }

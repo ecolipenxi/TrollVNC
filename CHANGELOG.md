@@ -2,6 +2,13 @@
 
 All notable changes to TrollVNC are documented here.
 
+# 3.4-278
+
+- Add a persistent two-way TCP presence channel to the Windows Controller.
+- Shorten UDP keepalive to two seconds and validate Controller acknowledgements.
+- Keep all network keepalive independent from HID events so a sleeping display
+  is not flashed or unlocked.
+
 ## [3.2] – 2026-04-19
 
 ### Added
