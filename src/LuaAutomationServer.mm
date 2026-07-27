@@ -148,8 +148,12 @@ static int LuaDeviceWake(lua_State *L) {
         return 1;
     }
     auto &api = ScreenApi();
-    if (api.undim) api.undim();
-    else [STHIDEventGenerator.sharedGenerator powerPress];
+    if (!api.undim) {
+        lua_pushnil(L);
+        lua_pushstring(L, "safe wake API unavailable");
+        return 2;
+    }
+    api.undim();
     lua_pushboolean(L, true);
     return 1;
 }
@@ -161,8 +165,12 @@ static int LuaDeviceSleep(lua_State *L) {
         return 1;
     }
     auto &api = ScreenApi();
-    if (api.lockDevice) api.lockDevice();
-    else [STHIDEventGenerator.sharedGenerator powerPress];
+    if (!api.lockDevice) {
+        lua_pushnil(L);
+        lua_pushstring(L, "safe sleep API unavailable");
+        return 2;
+    }
+    api.lockDevice();
     lua_pushboolean(L, true);
     return 1;
 }
