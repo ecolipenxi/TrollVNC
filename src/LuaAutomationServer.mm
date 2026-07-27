@@ -6,8 +6,10 @@
 
 #import "LuaAutomationServer.h"
 #import "STHIDEventGenerator.h"
+#import "TVFrameSnapshot.h"
 
 #import <UIKit/UIKit.h>
+#import <Vision/Vision.h>
 
 #include <algorithm>
 #include <atomic>
@@ -29,6 +31,13 @@ extern "C" {
 #include "lauxlib.h"
 #include "lua.h"
 #include "lualib.h"
+
+FOUNDATION_EXPORT NSString *const SBSApplicationLaunchOptionUnlockDeviceKey;
+FOUNDATION_EXPORT
+int SBSLaunchApplicationWithIdentifierAndURLAndLaunchOptions(
+    CFStringRef bundleIdentifier, CFURLRef _Nullable url,
+    CFDictionaryRef _Nullable appOptions, CFDictionaryRef _Nullable launchOptions,
+    BOOL suspended);
 }
 
 namespace {
@@ -47,6 +56,11 @@ std::atomic_bool gRunning{false};
 std::atomic_bool gCancel{false};
 std::mutex gScriptMutex;
 std::thread gScriptThread;
+std::mutex gStatusMutex;
+std::string gLastError;
+std::vector<std::string> gRecentLogs;
+double gStartedAt = 0;
+double gFinishedAt = 0;
 
 static std::string JsonEscape(const std::string &value) {
     std::string out;
@@ -117,12 +131,163 @@ static int LuaSysToast(lua_State *L) {
 static int LuaLog(lua_State *L) {
     const char *text = luaL_tolstring(L, 1, nullptr);
     NSLog(@"[LuaAgent] %s", text ?: "");
+    {
+        std::lock_guard<std::mutex> lock(gStatusMutex);
+        gRecentLogs.emplace_back(text ?: "");
+        if (gRecentLogs.size() > 200) gRecentLogs.erase(gRecentLogs.begin());
+    }
     lua_pop(L, 1);
     return 0;
 }
 
 static int LuaScreenInit(lua_State *) {
     return 0;
+}
+
+static int LuaScreenGetColor(lua_State *L) {
+    double x = luaL_checknumber(L, 1);
+    double y = luaL_checknumber(L, 2);
+    int width = 0, height = 0;
+    NSData *frame = TVCopyLatestFrameBGRA(&width, &height);
+    if (!frame || width <= 0 || height <= 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+    CGSize nativeSize = UIScreen.mainScreen.nativeBounds.size;
+    int px = (int)llround(x * width / MAX(1.0, nativeSize.width));
+    int py = (int)llround(y * height / MAX(1.0, nativeSize.height));
+    px = MAX(0, MIN(width - 1, px));
+    py = MAX(0, MIN(height - 1, py));
+    const uint8_t *bytes = static_cast<const uint8_t *>(frame.bytes);
+    const uint8_t *pixel = bytes + ((size_t)py * width + px) * 4;
+    uint32_t rgb = ((uint32_t)pixel[2] << 16) | ((uint32_t)pixel[1] << 8) | pixel[0];
+    lua_pushinteger(L, rgb);
+    return 1;
+}
+
+static NSData *CopyImageBGRA(UIImage *image, int *outWidth, int *outHeight) {
+    CGImageRef cgImage = image.CGImage;
+    if (!cgImage) return nil;
+    int width = (int)CGImageGetWidth(cgImage);
+    int height = (int)CGImageGetHeight(cgImage);
+    NSMutableData *data = [NSMutableData dataWithLength:(size_t)width * height * 4];
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(
+        data.mutableBytes, width, height, 8, (size_t)width * 4, colorSpace,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    CGColorSpaceRelease(colorSpace);
+    if (!context) return nil;
+    CGContextDrawImage(context, CGRectMake(0, 0, width, height), cgImage);
+    CGContextRelease(context);
+    if (outWidth) *outWidth = width;
+    if (outHeight) *outHeight = height;
+    return data;
+}
+
+static int LuaScreenFindImage(lua_State *L) {
+    const char *pathCString = luaL_checkstring(L, 1);
+    double similarity = luaL_optnumber(L, 2, 0.90);
+    NSString *path = [[NSString stringWithUTF8String:pathCString] stringByExpandingTildeInPath];
+    UIImage *needleImage = [UIImage imageWithContentsOfFile:path];
+    int screenWidth = 0, screenHeight = 0;
+    NSData *screen = TVCopyLatestFrameBGRA(&screenWidth, &screenHeight);
+    int needleWidth = 0, needleHeight = 0;
+    NSData *needle = needleImage ? CopyImageBGRA(needleImage, &needleWidth, &needleHeight) : nil;
+    if (!screen || !needle || needleWidth <= 0 || needleHeight <= 0 ||
+        needleWidth > screenWidth || needleHeight > screenHeight) {
+        lua_pushinteger(L, -1);
+        lua_pushinteger(L, -1);
+        return 2;
+    }
+
+    const uint8_t *hay = static_cast<const uint8_t *>(screen.bytes);
+    const uint8_t *pin = static_cast<const uint8_t *>(needle.bytes);
+    int sampleX = MAX(1, needleWidth / 12);
+    int sampleY = MAX(1, needleHeight / 12);
+    double maxMeanDifference = (1.0 - MAX(0.0, MIN(1.0, similarity))) * 255.0;
+    int foundX = -1, foundY = -1;
+    for (int y = 0; y <= screenHeight - needleHeight && foundX < 0; y += 2) {
+        for (int x = 0; x <= screenWidth - needleWidth; x += 2) {
+            uint64_t difference = 0;
+            uint64_t channels = 0;
+            bool rejected = false;
+            for (int ny = 0; ny < needleHeight && !rejected; ny += sampleY) {
+                for (int nx = 0; nx < needleWidth; nx += sampleX) {
+                    const uint8_t *a = hay + ((size_t)(y + ny) * screenWidth + x + nx) * 4;
+                    const uint8_t *b = pin + ((size_t)ny * needleWidth + nx) * 4;
+                    difference += abs((int)a[0] - (int)b[0]);
+                    difference += abs((int)a[1] - (int)b[1]);
+                    difference += abs((int)a[2] - (int)b[2]);
+                    channels += 3;
+                    if (channels >= 24 && (double)difference / channels > maxMeanDifference * 1.8) {
+                        rejected = true;
+                        break;
+                    }
+                }
+            }
+            if (!rejected && channels > 0 && (double)difference / channels <= maxMeanDifference) {
+                foundX = x;
+                foundY = y;
+                break;
+            }
+        }
+    }
+    if (foundX < 0) {
+        lua_pushinteger(L, -1);
+        lua_pushinteger(L, -1);
+        return 2;
+    }
+    CGSize nativeSize = UIScreen.mainScreen.nativeBounds.size;
+    lua_pushinteger(L, llround(foundX * nativeSize.width / screenWidth));
+    lua_pushinteger(L, llround(foundY * nativeSize.height / screenHeight));
+    return 2;
+}
+
+static int LuaScreenOCR(lua_State *L) {
+    UIImage *image = TVCreateLatestFrameImage();
+    if (!image.CGImage) {
+        lua_pushnil(L);
+        lua_pushstring(L, "screen frame is unavailable");
+        return 2;
+    }
+    __block NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    VNRecognizeTextRequest *request =
+        [[VNRecognizeTextRequest alloc] initWithCompletionHandler:
+            ^(VNRequest *finishedRequest, NSError *error) {
+                if (error) return;
+                for (VNRecognizedTextObservation *observation in finishedRequest.results) {
+                    VNRecognizedText *candidate = [[observation topCandidates:1] firstObject];
+                    if (candidate.string.length) [lines addObject:candidate.string];
+                }
+            }];
+    request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+    request.usesLanguageCorrection = YES;
+    VNImageRequestHandler *handler =
+        [[VNImageRequestHandler alloc] initWithCGImage:image.CGImage options:@{}];
+    NSError *error = nil;
+    BOOL ok = [handler performRequests:@[request] error:&error];
+    if (!ok) {
+        lua_pushnil(L);
+        lua_pushstring(L, error.localizedDescription.UTF8String ?: "OCR failed");
+        return 2;
+    }
+    NSString *text = [lines componentsJoinedByString:@"\n"];
+    lua_pushstring(L, text.UTF8String ?: "");
+    return 1;
+}
+
+static int LuaAppRun(lua_State *L) {
+    const char *bundleCString = luaL_checkstring(L, 1);
+    NSString *bundleID = [NSString stringWithUTF8String:bundleCString];
+    int result = SBSLaunchApplicationWithIdentifierAndURLAndLaunchOptions(
+        (__bridge CFStringRef)bundleID, NULL, NULL,
+        (__bridge CFDictionaryRef)@{SBSApplicationLaunchOptionUnlockDeviceKey : @YES}, NO);
+    lua_pushboolean(L, result == 0);
+    if (result != 0) {
+        lua_pushfstring(L, "launch failed with code %d", result);
+        return 2;
+    }
+    return 1;
 }
 
 static int LuaKeyPress(lua_State *L) {
@@ -232,6 +397,18 @@ static void RegisterFunctions(lua_State *L) {
     lua_newtable(L);
     lua_pushcfunction(L, LuaScreenInit);
     lua_setfield(L, -2, "init");
+    lua_pushcfunction(L, LuaScreenGetColor);
+    lua_setfield(L, -2, "get_color");
+    lua_pushcfunction(L, LuaScreenGetColor);
+    lua_setfield(L, -2, "getColor");
+    lua_pushcfunction(L, LuaScreenFindImage);
+    lua_setfield(L, -2, "find_image");
+    lua_pushcfunction(L, LuaScreenFindImage);
+    lua_setfield(L, -2, "findImage");
+    lua_pushcfunction(L, LuaScreenOCR);
+    lua_setfield(L, -2, "ocr");
+    lua_pushcfunction(L, LuaScreenOCR);
+    lua_setfield(L, -2, "ocr_text");
     lua_setglobal(L, "screen");
 
     lua_newtable(L);
@@ -241,6 +418,16 @@ static void RegisterFunctions(lua_State *L) {
 
     lua_pushcfunction(L, LuaLog);
     lua_setglobal(L, "nLog");
+
+    lua_newtable(L);
+    lua_pushcfunction(L, LuaAppRun);
+    lua_setfield(L, -2, "run");
+    lua_setglobal(L, "app");
+
+    lua_pushcfunction(L, LuaScreenGetColor);
+    lua_setglobal(L, "getColor");
+    lua_pushcfunction(L, LuaScreenFindImage);
+    lua_setglobal(L, "findImage");
 }
 
 static std::string CheckSyntax(const std::string &script) {
@@ -258,6 +445,8 @@ static void StopScript() {
     gCancel.store(true);
     if (gScriptThread.joinable()) gScriptThread.join();
     gRunning.store(false);
+    std::lock_guard<std::mutex> statusLock(gStatusMutex);
+    gFinishedAt = [[NSDate date] timeIntervalSince1970];
 }
 
 static void StartScript(const std::string &script) {
@@ -265,6 +454,13 @@ static void StartScript(const std::string &script) {
     std::lock_guard<std::mutex> lock(gScriptMutex);
     gCancel.store(false);
     gRunning.store(true);
+    {
+        std::lock_guard<std::mutex> statusLock(gStatusMutex);
+        gLastError.clear();
+        gRecentLogs.clear();
+        gStartedAt = [[NSDate date] timeIntervalSince1970];
+        gFinishedAt = 0;
+    }
     gScriptThread = std::thread([script] {
         @autoreleasepool {
             lua_State *L = luaL_newstate();
@@ -278,10 +474,15 @@ static void StartScript(const std::string &script) {
             int status = luaL_loadbuffer(L, script.data(), script.size(), "remote-script");
             if (status == LUA_OK) status = lua_pcall(L, 0, LUA_MULTRET, 0);
             if (status != LUA_OK && !gCancel.load()) {
-                NSLog(@"[LuaAgent] runtime error: %s", lua_tostring(L, -1) ?: "unknown");
+                const char *message = lua_tostring(L, -1) ?: "unknown";
+                NSLog(@"[LuaAgent] runtime error: %s", message);
+                std::lock_guard<std::mutex> lock(gStatusMutex);
+                gLastError = message;
             }
             lua_close(L);
             gRunning.store(false);
+            std::lock_guard<std::mutex> lock(gStatusMutex);
+            gFinishedAt = [[NSDate date] timeIntervalSince1970];
         }
     });
 }
@@ -335,30 +536,63 @@ static bool ReceiveRequest(int fd, HttpRequest &request) {
     return true;
 }
 
-static void SendResponse(int fd, int status, const std::string &body) {
+static void SendBytes(int fd, int status, const char *contentType,
+                      const void *bytes, size_t length) {
     const char *reason = status == 200 ? "OK" : (status == 404 ? "Not Found" : "Bad Request");
     std::string headers = "HTTP/1.1 " + std::to_string(status) + " " + reason +
-        "\r\nContent-Type: application/json; charset=utf-8"
+        "\r\nContent-Type: " + contentType +
         "\r\nAccess-Control-Allow-Origin: *"
-        "\r\nConnection: close\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
-    std::string response = headers + body;
+        "\r\nConnection: close\r\nContent-Length: " + std::to_string(length) + "\r\n\r\n";
     size_t sent = 0;
-    while (sent < response.size()) {
-        ssize_t count = send(fd, response.data() + sent, response.size() - sent, 0);
+    while (sent < headers.size()) {
+        ssize_t count = send(fd, headers.data() + sent, headers.size() - sent, 0);
         if (count <= 0) break;
         sent += static_cast<size_t>(count);
     }
+    sent = 0;
+    const uint8_t *payload = static_cast<const uint8_t *>(bytes);
+    while (sent < length) {
+        ssize_t count = send(fd, payload + sent, length - sent, 0);
+        if (count <= 0) break;
+        sent += static_cast<size_t>(count);
+    }
+}
+
+static void SendResponse(int fd, int status, const std::string &body) {
+    SendBytes(fd, status, "application/json; charset=utf-8",
+              body.data(), body.size());
+}
+
+static std::string StatusDataJson() {
+    std::lock_guard<std::mutex> lock(gStatusMutex);
+    std::string logs = "[";
+    for (size_t i = 0; i < gRecentLogs.size(); i++) {
+        if (i) logs += ",";
+        logs += "\"" + JsonEscape(gRecentLogs[i]) + "\"";
+    }
+    logs += "]";
+    return "{\"running\":" + std::string(gRunning.load() ? "true" : "false") +
+        ",\"last_error\":\"" + JsonEscape(gLastError) +
+        "\",\"started_at\":" + std::to_string(gStartedAt) +
+        ",\"finished_at\":" + std::to_string(gFinishedAt) +
+        ",\"logs\":" + logs + "}";
 }
 
 static std::string DeviceInfoJson(uint16_t port) {
     UIDevice *device = UIDevice.currentDevice;
     std::string name = device.name.UTF8String ?: "iPhone";
     std::string version = device.systemVersion.UTF8String ?: "";
+    std::string lastError;
+    {
+        std::lock_guard<std::mutex> lock(gStatusMutex);
+        lastError = gLastError;
+    }
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
         "\",\"tsversion\":\"LuaAgent 0.1\",\"port\":" + std::to_string(port) +
-        ",\"is_running\":" + (gRunning.load() ? "true" : "false") + "}";
+        ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
+        ",\"last_error\":\"" + JsonEscape(lastError) + "\"}";
     return ApiJson(0, "Operation succeed", data);
 }
 
@@ -371,9 +605,18 @@ static void HandleClient(int fd, uint16_t port) {
     std::string path = request.path.substr(0, request.path.find('?'));
     if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
+    } else if (path == "/snapshot") {
+        NSData *jpeg = TVCreateLatestFrameJPEG(0.80);
+        if (!jpeg) {
+            SendResponse(fd, 400, ApiJson(503, "Screen frame is not ready"));
+        } else {
+            SendBytes(fd, 200, "image/jpeg", jpeg.bytes, jpeg.length);
+        }
     } else if (path == "/is_running") {
         SendResponse(fd, 200, ApiJson(0, "Operation succeed",
                                      gRunning.load() ? "true" : "false"));
+    } else if (path == "/status" || path == "/logs") {
+        SendResponse(fd, 200, ApiJson(0, "Operation succeed", StatusDataJson()));
     } else if (path == "/check_syntax") {
         std::string error = CheckSyntax(request.body);
         SendResponse(fd, 200, error.empty() ? ApiJson(0, "Operation succeed")

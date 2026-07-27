@@ -52,6 +52,7 @@
 #import "STHIDEventGenerator.h"
 #import "ScreenCapturer.h"
 #import "LuaAutomationServer.h"
+#import "TVFrameSnapshot.h"
 
 #define LocalizedString(key, comment, bundle, table)                                                                   \
     (NSLocalizedStringFromTableInBundle((key), (table), (bundle), (comment)) ?: (key))
@@ -1561,6 +1562,43 @@ static int gBytesPerPixel = 4; // ARGB/BGRA 32-bit
 
 static void *gFrontBuffer = NULL; // Exposed to VNC clients via gScreen->frameBuffer
 static void *gBackBuffer = NULL;  // We render into this and then swap
+
+NSData *TVCopyLatestFrameBGRA(int *width, int *height) {
+    if (!gFrontBuffer || gWidth <= 0 || gHeight <= 0 || gBytesPerPixel != 4)
+        return nil;
+    int frameWidth = gWidth;
+    int frameHeight = gHeight;
+    size_t length = (size_t)frameWidth * (size_t)frameHeight * 4;
+    NSData *copy = [NSData dataWithBytes:gFrontBuffer length:length];
+    if (width) *width = frameWidth;
+    if (height) *height = frameHeight;
+    return copy;
+}
+
+UIImage *TVCreateLatestFrameImage(void) {
+    int width = 0, height = 0;
+    NSData *pixels = TVCopyLatestFrameBGRA(&width, &height);
+    if (!pixels) return nil;
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGDataProviderRef provider =
+        CGDataProviderCreateWithCFData((__bridge CFDataRef)pixels);
+    CGBitmapInfo bitmapInfo =
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst;
+    CGImageRef imageRef = CGImageCreate(
+        width, height, 8, 32, (size_t)width * 4, colorSpace, bitmapInfo,
+        provider, NULL, false, kCGRenderingIntentDefault);
+    UIImage *image = imageRef ? [UIImage imageWithCGImage:imageRef] : nil;
+    if (imageRef) CGImageRelease(imageRef);
+    CGDataProviderRelease(provider);
+    CGColorSpaceRelease(colorSpace);
+    return image;
+}
+
+NSData *TVCreateLatestFrameJPEG(CGFloat quality) {
+    UIImage *image = TVCreateLatestFrameImage();
+    if (!image) return nil;
+    return UIImageJPEGRepresentation(image, MAX(0.1, MIN(1.0, quality)));
+}
 
 // Hash algorithm selection (auto: prefer CRC32 on ARM with hardware support)
 #if DEBUG
