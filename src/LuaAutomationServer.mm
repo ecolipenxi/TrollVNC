@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
@@ -160,6 +161,7 @@ struct SpringBoardScreenApi {
     void (*lockStatus)(mach_port_t, Boolean *, Boolean *) = nullptr;
     void (*undim)(void) = nullptr;
     void (*lockDevice)(void) = nullptr;
+    float (*backlightFactor)(void) = nullptr;
 };
 
 static SpringBoardScreenApi &ScreenApi() {
@@ -176,12 +178,28 @@ static SpringBoardScreenApi &ScreenApi() {
             dlsym(handle, "SBGetScreenLockStatus"));
         api.undim = reinterpret_cast<void (*)(void)>(dlsym(handle, "SBSUndimScreen"));
         api.lockDevice = reinterpret_cast<void (*)(void)>(dlsym(handle, "SBSLockDevice"));
+        // This reports the actual display backlight, unlike SBGetScreenLockStatus
+        // which remains "unlocked" when a passcode-free device's panel sleeps.
+        api.backlightFactor = reinterpret_cast<float (*)(void)>(
+            dlsym(handle, "SBGetCurrentBacklightFactor"));
     });
     return api;
 }
 
+static bool ReadBacklightFactor(float &factor) {
+    auto &api = ScreenApi();
+    if (!api.backlightFactor) return false;
+    factor = api.backlightFactor();
+    return std::isfinite(factor) && factor >= 0.0f && factor <= 1.5f;
+}
+
 static bool ReadScreenOn(bool &screenOn) {
     auto &api = ScreenApi();
+    float backlight = 0.0f;
+    if (ReadBacklightFactor(backlight)) {
+        screenOn = backlight > 0.01f;
+        return true;
+    }
     if (!api.serverPort || !api.lockStatus) return false;
     Boolean locked = false;
     Boolean passcode = false;
@@ -208,10 +226,26 @@ static int LuaDeviceWake(lua_State *L) {
         lua_pushstring(L, "safe wake API unavailable");
         return 2;
     }
-    // SBGetScreenLockStatus reports lock/passcode state, not whether the panel
-    // is illuminated. On passcode-free devices it can remain "unlocked" after
-    // the display sleeps, so never use it to skip the undim request.
+    // Always try the non-toggle SpringBoard wake first.  If the real backlight
+    // API confirms that the panel is still dark, use one HID power press; this
+    // is safe because it is never sent while the panel is known to be on.
     api.undim();
+    usleep(180 * 1000);
+    api.undim();
+
+    float backlight = 0.0f;
+    if (ReadBacklightFactor(backlight) && backlight <= 0.01f) {
+        [STHIDEventGenerator.sharedGenerator powerPress];
+        usleep(450 * 1000);
+        api.undim();
+        usleep(180 * 1000);
+        if (ReadBacklightFactor(backlight) && backlight <= 0.01f) {
+            lua_pushnil(L);
+            lua_pushstring(L, "panel remained dark after wake request");
+            return 2;
+        }
+    }
+
     lua_pushboolean(L, true);
     return 1;
 }
@@ -739,7 +773,7 @@ static std::string RunPresenceCommand(const std::string &line) {
         if (requestId.empty()) return "";
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.1\"}";
+            ",\"version\":\"LuaAgent 1.2\"}";
         std::string response = ApiJson(0, "Operation succeed", data);
         return "RESULT " + requestId + " " + EncodeBase64(response) + "\n";
     }
@@ -955,7 +989,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.1\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 1.2\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -1013,7 +1047,7 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
     if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.1\"}";
+            ",\"version\":\"LuaAgent 1.2\"}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
@@ -1123,7 +1157,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.1\"}";
+        "\",\"tsversion\":\"LuaAgent 1.2\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
