@@ -10,6 +10,7 @@
 
 #import <UIKit/UIKit.h>
 #import <Vision/Vision.h>
+#import <objc/message.h>
 
 #include <algorithm>
 #include <atomic>
@@ -22,6 +23,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -42,6 +44,8 @@ int SBSLaunchApplicationWithIdentifierAndURLAndLaunchOptions(
     CFStringRef bundleIdentifier, CFURLRef _Nullable url,
     CFDictionaryRef _Nullable appOptions, CFDictionaryRef _Nullable launchOptions,
     BOOL suspended);
+int SBSOpenSensitiveURLAndUnlock(CFURLRef url, char flags);
+CFStringRef _Nullable SBSCopyFrontmostApplicationDisplayIdentifier(void);
 }
 
 namespace {
@@ -70,6 +74,8 @@ std::vector<std::string> gRecentLogs;
 double gStartedAt = 0;
 double gFinishedAt = 0;
 bool gStoppedByUser = false;
+std::mutex gAppStateMutex;
+std::unordered_map<std::string, double> gRecentlyKilledApps;
 std::mutex gKeepAliveMutex;
 sockaddr_in gKeepAliveTarget{};
 bool gHasKeepAliveTarget = false;
@@ -385,9 +391,25 @@ static int LuaScreenFindImage(lua_State *L) {
     int sampleX = MAX(1, needleWidth / 12);
     int sampleY = MAX(1, needleHeight / 12);
     double maxMeanDifference = (1.0 - MAX(0.0, MIN(1.0, similarity))) * 255.0;
+    CGSize nativeSize = UIScreen.mainScreen.nativeBounds.size;
+    int searchMinX = 0, searchMinY = 0;
+    int searchMaxX = screenWidth - needleWidth;
+    int searchMaxY = screenHeight - needleHeight;
+    if (lua_gettop(L) >= 6) {
+        double rx = luaL_checknumber(L, 3);
+        double ry = luaL_checknumber(L, 4);
+        double rw = luaL_checknumber(L, 5);
+        double rh = luaL_checknumber(L, 6);
+        searchMinX = MAX(0, (int)floor(rx * screenWidth / MAX(1.0, nativeSize.width)));
+        searchMinY = MAX(0, (int)floor(ry * screenHeight / MAX(1.0, nativeSize.height)));
+        searchMaxX = MIN(searchMaxX, (int)ceil((rx + rw) * screenWidth /
+                                               MAX(1.0, nativeSize.width)) - needleWidth);
+        searchMaxY = MIN(searchMaxY, (int)ceil((ry + rh) * screenHeight /
+                                               MAX(1.0, nativeSize.height)) - needleHeight);
+    }
     int foundX = -1, foundY = -1;
-    for (int y = 0; y <= screenHeight - needleHeight && foundX < 0; y += 2) {
-        for (int x = 0; x <= screenWidth - needleWidth; x += 2) {
+    for (int y = searchMinY; y <= searchMaxY && foundX < 0; y += 2) {
+        for (int x = searchMinX; x <= searchMaxX; x += 2) {
             uint64_t difference = 0;
             uint64_t channels = 0;
             bool rejected = false;
@@ -417,7 +439,6 @@ static int LuaScreenFindImage(lua_State *L) {
         lua_pushinteger(L, -1);
         return 2;
     }
-    CGSize nativeSize = UIScreen.mainScreen.nativeBounds.size;
     lua_pushinteger(L, llround(foundX * nativeSize.width / screenWidth));
     lua_pushinteger(L, llround(foundY * nativeSize.height / screenHeight));
     return 2;
@@ -429,6 +450,27 @@ static int LuaScreenOCR(lua_State *L) {
         lua_pushnil(L);
         lua_pushstring(L, "screen frame is unavailable");
         return 2;
+    }
+    if (lua_gettop(L) >= 4) {
+        double x = luaL_checknumber(L, 1);
+        double y = luaL_checknumber(L, 2);
+        double width = luaL_checknumber(L, 3);
+        double height = luaL_checknumber(L, 4);
+        CGSize nativeSize = UIScreen.mainScreen.nativeBounds.size;
+        size_t imageWidth = CGImageGetWidth(image.CGImage);
+        size_t imageHeight = CGImageGetHeight(image.CGImage);
+        CGRect crop = CGRectMake(x * imageWidth / MAX(1.0, nativeSize.width),
+                                 y * imageHeight / MAX(1.0, nativeSize.height),
+                                 width * imageWidth / MAX(1.0, nativeSize.width),
+                                 height * imageHeight / MAX(1.0, nativeSize.height));
+        crop = CGRectIntersection(crop, CGRectMake(0, 0, imageWidth, imageHeight));
+        if (!CGRectIsEmpty(crop)) {
+            CGImageRef cropped = CGImageCreateWithImageInRect(image.CGImage, crop);
+            if (cropped) {
+                image = [UIImage imageWithCGImage:cropped];
+                CGImageRelease(cropped);
+            }
+        }
     }
     __block NSMutableArray<NSString *> *lines = [NSMutableArray array];
     VNRecognizeTextRequest *request =
@@ -467,6 +509,104 @@ static int LuaAppRun(lua_State *L) {
         lua_pushfstring(L, "launch failed with code %d", result);
         return 2;
     }
+    {
+        std::lock_guard<std::mutex> lock(gAppStateMutex);
+        gRecentlyKilledApps.erase(bundleCString);
+    }
+    return 1;
+}
+
+static int LuaAppKill(lua_State *L) {
+    const char *bundleCString = luaL_checkstring(L, 1);
+    NSString *bundleID = [NSString stringWithUTF8String:bundleCString];
+    Class serviceClass = NSClassFromString(@"FBSSystemService");
+    SEL sharedSelector = NSSelectorFromString(@"sharedService");
+    SEL terminateSelector = NSSelectorFromString(
+        @"terminateApplication:forReason:andReport:withDescription:");
+    if (!serviceClass || ![serviceClass respondsToSelector:sharedSelector]) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "application termination service unavailable");
+        return 2;
+    }
+    id service = ((id (*)(id, SEL))objc_msgSend)(serviceClass, sharedSelector);
+    if (!service || ![service respondsToSelector:terminateSelector]) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "application termination selector unavailable");
+        return 2;
+    }
+    ((void (*)(id, SEL, id, long long, BOOL, id))objc_msgSend)(
+        service, terminateSelector, bundleID, 1LL, NO, @"LuaAgent app.kill");
+    {
+        std::lock_guard<std::mutex> lock(gAppStateMutex);
+        gRecentlyKilledApps[bundleCString] = [[NSDate date] timeIntervalSince1970];
+    }
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+static int LuaAppState(lua_State *L) {
+    const char *bundleCString = luaL_checkstring(L, 1);
+    double now = [[NSDate date] timeIntervalSince1970];
+    {
+        std::lock_guard<std::mutex> lock(gAppStateMutex);
+        auto found = gRecentlyKilledApps.find(bundleCString);
+        if (found != gRecentlyKilledApps.end() && now - found->second < 15.0) {
+            lua_pushstring(L, "NOT RUNNING");
+            return 1;
+        }
+    }
+    CFStringRef frontmostRef = SBSCopyFrontmostApplicationDisplayIdentifier();
+    NSString *frontmost = CFBridgingRelease(frontmostRef);
+    if ([frontmost isEqualToString:[NSString stringWithUTF8String:bundleCString]])
+        lua_pushstring(L, "ACTIVE");
+    else
+        lua_pushstring(L, "BACKGROUND");
+    return 1;
+}
+
+static int LuaAppOpenURL(lua_State *L) {
+    const char *urlCString = luaL_checkstring(L, 1);
+    NSURL *url = [NSURL URLWithString:[NSString stringWithUTF8String:urlCString]];
+    if (!url) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "invalid URL");
+        return 2;
+    }
+    int result = SBSOpenSensitiveURLAndUnlock((__bridge CFURLRef)url, 1);
+    lua_pushboolean(L, result == 0);
+    if (result != 0) {
+        lua_pushfstring(L, "open URL failed with code %d", result);
+        return 2;
+    }
+    return 1;
+}
+
+static int LuaSysInputText(lua_State *L) {
+    const char *textCString = luaL_checkstring(L, 1);
+    NSString *text = [NSString stringWithUTF8String:textCString];
+    STHIDEventGenerator *generator = STHIDEventGenerator.sharedGenerator;
+    for (NSUInteger index = 0; index < text.length && !gCancel.load(); index++) {
+        NSString *character = [text substringWithRange:NSMakeRange(index, 1)];
+        [generator keyPress:character];
+        usleep(35 * 1000);
+    }
+    lua_pushboolean(L, !gCancel.load());
+    return 1;
+}
+
+static int LuaSysRootDir(lua_State *L) {
+    NSString *path = @"/var/mobile/Library/LuaAgent";
+    NSError *error = nil;
+    [NSFileManager.defaultManager createDirectoryAtPath:path
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:&error];
+    if (error) {
+        lua_pushnil(L);
+        lua_pushstring(L, error.localizedDescription.UTF8String ?: "cannot create root directory");
+        return 2;
+    }
+    lua_pushstring(L, path.UTF8String);
     return 1;
 }
 
@@ -580,6 +720,30 @@ static int LuaTouchOff(lua_State *L) {
     return 1;
 }
 
+static int LuaTouchTap(lua_State *L) {
+    CGPoint point = ScriptPoint(luaL_checknumber(L, 1), luaL_checknumber(L, 2));
+    [STHIDEventGenerator.sharedGenerator tap:point];
+    return 0;
+}
+
+static int LuaTouchLongPress(lua_State *L) {
+    CGPoint point = ScriptPoint(luaL_checknumber(L, 1), luaL_checknumber(L, 2));
+    (void)luaL_optinteger(L, 3, 2000);
+    [STHIDEventGenerator.sharedGenerator longPress:point];
+    return 0;
+}
+
+static int LuaTouchSwipe(lua_State *L) {
+    CGPoint start = ScriptPoint(luaL_checknumber(L, 1), luaL_checknumber(L, 2));
+    CGPoint end = ScriptPoint(luaL_checknumber(L, 3), luaL_checknumber(L, 4));
+    double durationMs = luaL_optnumber(L, 5, 350.0);
+    NSTimeInterval duration = MAX(0.05, MIN(3.0, durationMs / 1000.0));
+    [STHIDEventGenerator.sharedGenerator dragLinearWithStartPoint:start
+                                                         endPoint:end
+                                                         duration:duration];
+    return 0;
+}
+
 static void RegisterFunctions(lua_State *L) {
     luaL_newmetatable(L, "TVTouchGesture");
     lua_pushvalue(L, -1);
@@ -600,6 +764,10 @@ static void RegisterFunctions(lua_State *L) {
     lua_setfield(L, -2, "msleep");
     lua_pushcfunction(L, LuaSysToast);
     lua_setfield(L, -2, "toast");
+    lua_pushcfunction(L, LuaSysInputText);
+    lua_setfield(L, -2, "input_text");
+    lua_pushcfunction(L, LuaSysRootDir);
+    lua_setfield(L, -2, "root_dir");
     lua_setglobal(L, "sys");
 
     lua_newtable(L);
@@ -627,6 +795,12 @@ static void RegisterFunctions(lua_State *L) {
     lua_newtable(L);
     lua_pushcfunction(L, LuaTouchOn);
     lua_setfield(L, -2, "on");
+    lua_pushcfunction(L, LuaTouchTap);
+    lua_setfield(L, -2, "tap");
+    lua_pushcfunction(L, LuaTouchLongPress);
+    lua_setfield(L, -2, "long_press");
+    lua_pushcfunction(L, LuaTouchSwipe);
+    lua_setfield(L, -2, "swipe");
     lua_setglobal(L, "touch");
 
     lua_pushcfunction(L, LuaLog);
@@ -635,6 +809,14 @@ static void RegisterFunctions(lua_State *L) {
     lua_newtable(L);
     lua_pushcfunction(L, LuaAppRun);
     lua_setfield(L, -2, "run");
+    lua_pushcfunction(L, LuaAppRun);
+    lua_setfield(L, -2, "activate");
+    lua_pushcfunction(L, LuaAppKill);
+    lua_setfield(L, -2, "kill");
+    lua_pushcfunction(L, LuaAppState);
+    lua_setfield(L, -2, "state");
+    lua_pushcfunction(L, LuaAppOpenURL);
+    lua_setfield(L, -2, "open_url");
     lua_pushcfunction(L, LuaAppRunShortcut);
     lua_setfield(L, -2, "run_shortcut");
     lua_setglobal(L, "app");
@@ -773,7 +955,7 @@ static std::string RunPresenceCommand(const std::string &line) {
         if (requestId.empty()) return "";
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.2\"}";
+            ",\"version\":\"LuaAgent 1.3\"}";
         std::string response = ApiJson(0, "Operation succeed", data);
         return "RESULT " + requestId + " " + EncodeBase64(response) + "\n";
     }
@@ -989,7 +1171,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.2\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 1.3\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -997,6 +1179,23 @@ static std::string DeviceInfoJson(uint16_t port) {
         ",\"stopped_by_user\":" + (stoppedByUser ? "true" : "false") +
         ",\"last_error\":\"" + JsonEscape(lastError) + "\"}";
     return ApiJson(0, "Operation succeed", data);
+}
+
+static bool ConfigureTrollStoreSilentInstall() {
+    NSString *preferencesPath = @"/var/mobile/Library/Preferences/com.opa334.TrollStore.plist";
+    NSMutableDictionary *preferences =
+        [NSMutableDictionary dictionaryWithContentsOfFile:preferencesPath];
+    if (!preferences) preferences = [NSMutableDictionary dictionary];
+    preferences[@"installAlertConfiguration"] = @2;
+    BOOL wroteFile = [preferences writeToFile:preferencesPath atomically:YES];
+
+    // TrollStore itself initializes this exact path as a suite name. Updating
+    // both representations makes the setting visible immediately and after a
+    // reboot on TrollStore 2.x builds.
+    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:preferencesPath];
+    [defaults setInteger:2 forKey:@"installAlertConfiguration"];
+    BOOL synchronized = [defaults synchronize];
+    return wroteFile || synchronized;
 }
 
 static std::string LaunchTrollStoreUpdate(
@@ -1018,6 +1217,9 @@ static std::string LaunchTrollStoreUpdate(
         return ApiJson(403, "Update URL host must match Controller IP");
     }
 
+    if (!ConfigureTrollStoreSilentInstall())
+        return ApiJson(500, "Cannot enable TrollStore silent installation");
+
     NSURLComponents *install = [[NSURLComponents alloc] init];
     install.scheme = @"apple-magnifier";
     install.host = @"install";
@@ -1034,7 +1236,8 @@ static std::string LaunchTrollStoreUpdate(
     if (result != 0) {
         return ApiJson(500, "Cannot launch TrollStore, code " + std::to_string(result));
     }
-    return ApiJson(0, "TrollStore update started");
+    return ApiJson(0, "TrollStore silent update started",
+                   "{\"silent_install\":true,\"auto_restart\":true}");
 }
 
 static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
@@ -1047,7 +1250,8 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
     if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.2\"}";
+            ",\"version\":\"LuaAgent 1.3\",\"silent_update\":true,"
+            "\"auto_restart\":true}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
@@ -1157,7 +1361,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.2\"}";
+        "\",\"tsversion\":\"LuaAgent 1.3\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
