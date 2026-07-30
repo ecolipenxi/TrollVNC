@@ -76,6 +76,7 @@ double gFinishedAt = 0;
 bool gStoppedByUser = false;
 std::mutex gAppStateMutex;
 std::unordered_map<std::string, double> gRecentlyKilledApps;
+std::mutex gUpdateMutex;
 std::mutex gKeepAliveMutex;
 sockaddr_in gKeepAliveTarget{};
 bool gHasKeepAliveTarget = false;
@@ -955,7 +956,7 @@ static std::string RunPresenceCommand(const std::string &line) {
         if (requestId.empty()) return "";
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.3\"}";
+            ",\"version\":\"LuaAgent 1.4\"}";
         std::string response = ApiJson(0, "Operation succeed", data);
         return "RESULT " + requestId + " " + EncodeBase64(response) + "\n";
     }
@@ -1171,7 +1172,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.3\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 1.4\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -1182,20 +1183,45 @@ static std::string DeviceInfoJson(uint16_t port) {
 }
 
 static bool ConfigureTrollStoreSilentInstall() {
+    std::lock_guard<std::mutex> lock(gUpdateMutex);
     NSString *preferencesPath = @"/var/mobile/Library/Preferences/com.opa334.TrollStore.plist";
+
+    // The Agent daemon runs as root while TrollStore reads preferences as the
+    // mobile user. NSUserDefaults uses the caller's cfprefsd domain, so writing
+    // this suite as root does not update the value TrollStore sees. Switch the
+    // effective UID briefly to mobile (501), write and synchronize the exact
+    // absolute suite used by TrollStore, then restore root before launching it.
+    uid_t originalEuid = geteuid();
+    bool changedUser = originalEuid == 0 && seteuid(501) == 0;
+    if (originalEuid == 0 && !changedUser) return false;
+
     NSMutableDictionary *preferences =
         [NSMutableDictionary dictionaryWithContentsOfFile:preferencesPath];
     if (!preferences) preferences = [NSMutableDictionary dictionary];
     preferences[@"installAlertConfiguration"] = @2;
     BOOL wroteFile = [preferences writeToFile:preferencesPath atomically:YES];
 
-    // TrollStore itself initializes this exact path as a suite name. Updating
-    // both representations makes the setting visible immediately and after a
-    // reboot on TrollStore 2.x builds.
     NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:preferencesPath];
-    [defaults setInteger:2 forKey:@"installAlertConfiguration"];
+    [defaults setObject:@2 forKey:@"installAlertConfiguration"];
     BOOL synchronized = [defaults synchronize];
-    return wroteFile || synchronized;
+    usleep(150 * 1000);
+
+    bool restoredUser = !changedUser || seteuid(originalEuid) == 0;
+    return restoredUser && (wroteFile || synchronized);
+}
+
+static void StopRunningTrollStore() {
+    Class serviceClass = NSClassFromString(@"FBSSystemService");
+    SEL sharedSelector = NSSelectorFromString(@"sharedService");
+    SEL terminateSelector = NSSelectorFromString(
+        @"terminateApplication:forReason:andReport:withDescription:");
+    if (!serviceClass || ![serviceClass respondsToSelector:sharedSelector]) return;
+    id service = ((id (*)(id, SEL))objc_msgSend)(serviceClass, sharedSelector);
+    if (!service || ![service respondsToSelector:terminateSelector]) return;
+    ((void (*)(id, SEL, id, long long, BOOL, id))objc_msgSend)(
+        service, terminateSelector, @"com.opa334.TrollStore", 1LL, NO,
+        @"LuaAgent silent update");
+    usleep(300 * 1000);
 }
 
 static std::string LaunchTrollStoreUpdate(
@@ -1217,6 +1243,7 @@ static std::string LaunchTrollStoreUpdate(
         return ApiJson(403, "Update URL host must match Controller IP");
     }
 
+    StopRunningTrollStore();
     if (!ConfigureTrollStoreSilentInstall())
         return ApiJson(500, "Cannot enable TrollStore silent installation");
 
@@ -1250,7 +1277,7 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
     if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.3\",\"silent_update\":true,"
+            ",\"version\":\"LuaAgent 1.4\",\"silent_update\":true,"
             "\"auto_restart\":true}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
@@ -1361,7 +1388,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.3\"}";
+        "\",\"tsversion\":\"LuaAgent 1.4\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
