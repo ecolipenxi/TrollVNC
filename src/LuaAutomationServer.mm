@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -951,7 +952,7 @@ static std::string RunPresenceCommand(const std::string &line) {
         if (requestId.empty()) return "";
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.6\"}";
+            ",\"version\":\"LuaAgent 1.7\"}";
         std::string response = ApiJson(0, "Operation succeed", data);
         return "RESULT " + requestId + " " + EncodeBase64(response) + "\n";
     }
@@ -1147,6 +1148,32 @@ static std::string StatusDataJson() {
         ",\"logs\":" + logs + "}";
 }
 
+static bool IsAllowedAssetName(const std::string &name) {
+    return name == "timkiem.png" || name == "search.png" ||
+           name == "taive.png" || name == "dongxu.png" || name == "meo.png";
+}
+
+static std::string UploadLuaAsset(const HttpRequest &request) {
+    if (request.method != "POST") return ApiJson(405, "Asset upload requires POST");
+    std::string name = QueryValue(request.path, "name");
+    if (!IsAllowedAssetName(name)) return ApiJson(400, "Unsupported asset name");
+    if (request.body.empty() || request.body.size() > 512 * 1024)
+        return ApiJson(400, "Asset size is invalid");
+    NSString *directory = @"/var/mobile/Library/LuaAgent/codetiktok/images";
+    NSError *directoryError = nil;
+    [NSFileManager.defaultManager createDirectoryAtPath:directory
+                             withIntermediateDirectories:YES
+                                              attributes:nil
+                                                   error:&directoryError];
+    if (directoryError) return ApiJson(500, "Cannot create asset directory");
+    NSString *path = [directory stringByAppendingPathComponent:
+        [NSString stringWithUTF8String:name.c_str()]];
+    NSData *data = [NSData dataWithBytes:request.body.data() length:request.body.size()];
+    if (![data writeToFile:path options:NSDataWritingAtomic error:&directoryError] || directoryError)
+        return ApiJson(500, "Cannot write asset");
+    return ApiJson(0, "Asset uploaded");
+}
+
 static std::string DeviceInfoJson(uint16_t port) {
     UIDevice *device = UIDevice.currentDevice;
     std::string name = device.name.UTF8String ?: "iPhone";
@@ -1167,7 +1194,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.6\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 1.7\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -1270,10 +1297,14 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
         return;
     }
     std::string path = request.path.substr(0, request.path.find('?'));
-    if (path == "/health") {
+    if (path == "/upload_asset") {
+        std::string response = UploadLuaAsset(request);
+        bool ok = response.find("\"code\":0") != std::string::npos;
+        SendResponse(fd, ok ? 200 : 400, response);
+    } else if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.6\",\"silent_update\":true,"
+            ",\"version\":\"LuaAgent 1.7\",\"silent_update\":true,"
             "\"auto_restart\":false}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
@@ -1384,7 +1415,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.6\"}";
+        "\",\"tsversion\":\"LuaAgent 1.7\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
