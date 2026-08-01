@@ -818,6 +818,25 @@ static void RegisterFunctions(lua_State *L) {
     lua_setfield(L, -2, "run_shortcut");
     lua_setglobal(L, "app");
 
+    // Compatibility aliases for scripts originally written against the
+    // AutoTouch-style names used by the JavaScript sources.
+    auto Alias = [&](const char *tableName, const char *fieldName,
+                     const char *globalName) {
+        lua_getglobal(L, tableName);
+        lua_getfield(L, -1, fieldName);
+        lua_setglobal(L, globalName);
+        lua_pop(L, 1);
+    };
+    Alias("app", "run", "appRun");
+    Alias("app", "activate", "appActivate");
+    Alias("app", "kill", "appKill");
+    Alias("app", "state", "appState");
+    Alias("app", "open_url", "openURL");
+    Alias("app", "run_shortcut", "appRunShortcut");
+    Alias("sys", "input_text", "inputText");
+    Alias("sys", "root_dir", "rootDir");
+    Alias("sys", "toast", "toast");
+
     lua_newtable(L);
     lua_pushcfunction(L, LuaDeviceIsScreenOn);
     lua_setfield(L, -2, "is_screen_on");
@@ -952,7 +971,7 @@ static std::string RunPresenceCommand(const std::string &line) {
         if (requestId.empty()) return "";
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.8\"}";
+            ",\"version\":\"LuaAgent 1.9\"}";
         std::string response = ApiJson(0, "Operation succeed", data);
         return "RESULT " + requestId + " " + EncodeBase64(response) + "\n";
     }
@@ -1204,7 +1223,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.8\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 1.9\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -1314,7 +1333,7 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
     } else if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.8\",\"silent_update\":true,"
+            ",\"version\":\"LuaAgent 1.9\",\"silent_update\":true,"
             "\"auto_restart\":false}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
@@ -1425,7 +1444,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.8\"}";
+        "\",\"tsversion\":\"LuaAgent 1.9\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
