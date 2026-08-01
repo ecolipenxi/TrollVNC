@@ -30,7 +30,6 @@
 #include <arpa/inet.h>
 #include <mach/mach.h>
 #include <netinet/in.h>
-#include <spawn.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -47,7 +46,6 @@ int SBSLaunchApplicationWithIdentifierAndURLAndLaunchOptions(
     BOOL suspended);
 int SBSOpenSensitiveURLAndUnlock(CFURLRef url, char flags);
 CFStringRef _Nullable SBSCopyFrontmostApplicationDisplayIdentifier(void);
-extern char **environ;
 }
 
 namespace {
@@ -953,7 +951,7 @@ static std::string RunPresenceCommand(const std::string &line) {
         if (requestId.empty()) return "";
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.5\"}";
+            ",\"version\":\"LuaAgent 1.6\"}";
         std::string response = ApiJson(0, "Operation succeed", data);
         return "RESULT " + requestId + " " + EncodeBase64(response) + "\n";
     }
@@ -1169,7 +1167,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.5\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 1.6\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -1221,43 +1219,6 @@ static void StopRunningTrollStore() {
     usleep(300 * 1000);
 }
 
-static bool SchedulePostUpdateRelaunch() {
-    NSString *serverPath = NSProcessInfo.processInfo.arguments.firstObject;
-    if (!serverPath.length) return false;
-    NSString *managerPath =
-        [[serverPath stringByDeletingLastPathComponent]
-            stringByAppendingPathComponent:@"trollvncmanager"];
-    if (![NSFileManager.defaultManager isExecutableFileAtPath:managerPath]) return false;
-
-    // TrollStore replaces the entire app bundle, which deletes the running
-    // manager/server executables. A system /bin/sh child survives that bundle
-    // replacement, waits until a different trollvncmanager inode appears,
-    // then starts the manager from the newly installed bundle.
-    NSString *script = [NSString stringWithFormat:
-        @"old='%@'; old_inode=$(stat -f %%i \"$old\" 2>/dev/null); "
-         "(i=0; while [ $i -lt 180 ]; do "
-           "for mgr in $(find /var/containers/Bundle/Application "
-             "-path '*/TrollVNC.app/trollvncmanager' -type f 2>/dev/null); do "
-             "inode=$(stat -f %%i \"$mgr\" 2>/dev/null); "
-             "if [ \"$mgr\" != \"$old\" ] || [ \"$inode\" != \"$old_inode\" ]; then "
-               "\"$mgr\" >>/tmp/luaagent-update-helper.log 2>&1 & exit 0; "
-             "fi; "
-           "done; "
-           "sleep 1; i=$((i+1)); "
-         "done) >>/tmp/luaagent-update-helper.log 2>&1 &",
-        [managerPath stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
-
-    const char *shell = "/bin/sh";
-    char *const arguments[] = {
-        const_cast<char *>(shell),
-        const_cast<char *>("-c"),
-        const_cast<char *>(script.UTF8String),
-        nullptr
-    };
-    pid_t child = 0;
-    return posix_spawn(&child, shell, nullptr, nullptr, arguments, environ) == 0;
-}
-
 static std::string LaunchTrollStoreUpdate(
     const std::string &remoteUrl, const sockaddr_in &peer) {
     if (remoteUrl.empty() || remoteUrl.size() > 2048)
@@ -1278,10 +1239,9 @@ static std::string LaunchTrollStoreUpdate(
     }
 
     StopRunningTrollStore();
-    if (!ConfigureTrollStoreSilentInstall())
-        return ApiJson(500, "Cannot enable TrollStore silent installation");
-    if (!SchedulePostUpdateRelaunch())
-        return ApiJson(500, "Cannot schedule Agent restart after installation");
+    // Best effort only. The Windows Controller clicks Install through VNC,
+    // so an unavailable TrollStore preference must not block the update UI.
+    (void)ConfigureTrollStoreSilentInstall();
 
     NSURLComponents *install = [[NSURLComponents alloc] init];
     install.scheme = @"apple-magnifier";
@@ -1299,8 +1259,8 @@ static std::string LaunchTrollStoreUpdate(
     if (result != 0) {
         return ApiJson(500, "Cannot launch TrollStore, code " + std::to_string(result));
     }
-    return ApiJson(0, "TrollStore silent update started",
-                   "{\"silent_install\":true,\"auto_restart\":true}");
+    return ApiJson(0, "TrollStore update started",
+                   "{\"silent_install\":true,\"auto_restart\":false}");
 }
 
 static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
@@ -1313,8 +1273,8 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
     if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.5\",\"silent_update\":true,"
-            "\"auto_restart\":true}";
+            ",\"version\":\"LuaAgent 1.6\",\"silent_update\":true,"
+            "\"auto_restart\":false}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
@@ -1424,7 +1384,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.5\"}";
+        "\",\"tsversion\":\"LuaAgent 1.6\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
