@@ -1149,15 +1149,25 @@ static std::string StatusDataJson() {
 }
 
 static bool IsAllowedAssetName(const std::string &name) {
-    return name == "timkiem.png" || name == "search.png" ||
-           name == "taive.png" || name == "dongxu.png" || name == "meo.png";
+    if (name.empty() || name.size() > 96 || name.find('/') != std::string::npos ||
+        name.find('\\') != std::string::npos)
+        return false;
+    auto allowed = [](unsigned char c) {
+        return std::isalnum(c) || c == '_' || c == '-' || c == '.';
+    };
+    if (!std::all_of(name.begin(), name.end(),
+                     [&](char c) { return allowed(static_cast<unsigned char>(c)); }))
+        return false;
+    std::string lower = name;
+    for (char &c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg");
 }
 
 static std::string UploadLuaAsset(const HttpRequest &request) {
     if (request.method != "POST") return ApiJson(405, "Asset upload requires POST");
     std::string name = QueryValue(request.path, "name");
     if (!IsAllowedAssetName(name)) return ApiJson(400, "Unsupported asset name");
-    if (request.body.empty() || request.body.size() > 512 * 1024)
+    if (request.body.empty() || request.body.size() > 5 * 1024 * 1024)
         return ApiJson(400, "Asset size is invalid");
     NSString *directory = @"/var/mobile/Library/LuaAgent/codetiktok/images";
     NSError *directoryError = nil;
