@@ -442,7 +442,11 @@ static int LuaScreenFindImage(lua_State *L) {
 }
 
 static int LuaScreenOCR(lua_State *L) {
-    UIImage *image = TVCreateLatestFrameImage();
+    // OCR must observe the screen at the time of the Lua call. The VNC front
+    // buffer can remain unchanged when no viewer is requesting frames, which
+    // made long-running scripts read text from an earlier app screen.
+    NSData *freshJPEG = TVCreateFreshFrameJPEG(0.96, 2.0);
+    UIImage *image = freshJPEG ? [UIImage imageWithData:freshJPEG] : nil;
     if (!image.CGImage) {
         lua_pushnil(L);
         lua_pushstring(L, "screen frame is unavailable");
@@ -662,6 +666,17 @@ static TouchGesture *CheckTouch(lua_State *L) {
     return static_cast<TouchGesture *>(luaL_checkudata(L, 1, "TVTouchGesture"));
 }
 
+static void SendRawTap(CGPoint point) {
+    // The convenience -tap: path is ignored by some iOS 15 system permission
+    // alerts and can destabilize the daemon on affected iPhone 6s/7 units.
+    // TrollVNC pointer input uses explicit touch-down/lift-up events and works
+    // on the same alerts, so expose that exact, proven sequence to Lua too.
+    STHIDEventGenerator *generator = STHIDEventGenerator.sharedGenerator;
+    [generator touchDownAtPoints:&point touchCount:1];
+    SleepCancelable(90);
+    [generator liftUpAtPoints:&point touchCount:1];
+}
+
 static int LuaTouchOn(lua_State *L) {
     double x = luaL_checknumber(L, 1);
     double y = luaL_checknumber(L, 2);
@@ -711,7 +726,7 @@ static int LuaTouchOff(lua_State *L) {
     if (gesture->moved) {
         [generator dragLinearWithStartPoint:start endPoint:end duration:gesture->duration];
     } else {
-        [generator tap:start];
+        SendRawTap(start);
     }
     lua_settop(L, 1);
     return 1;
@@ -719,7 +734,7 @@ static int LuaTouchOff(lua_State *L) {
 
 static int LuaTouchTap(lua_State *L) {
     CGPoint point = ScriptPoint(luaL_checknumber(L, 1), luaL_checknumber(L, 2));
-    [STHIDEventGenerator.sharedGenerator tap:point];
+    SendRawTap(point);
     return 0;
 }
 
@@ -971,7 +986,7 @@ static std::string RunPresenceCommand(const std::string &line) {
         if (requestId.empty()) return "";
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.9\"}";
+            ",\"version\":\"LuaAgent 2.0\"}";
         std::string response = ApiJson(0, "Operation succeed", data);
         return "RESULT " + requestId + " " + EncodeBase64(response) + "\n";
     }
@@ -1223,7 +1238,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.9\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 2.0\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -1333,7 +1348,7 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
     } else if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 1.9\",\"silent_update\":true,"
+            ",\"version\":\"LuaAgent 2.0\",\"silent_update\":true,"
             "\"auto_restart\":false}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
@@ -1444,7 +1459,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 1.9\"}";
+        "\",\"tsversion\":\"LuaAgent 2.0\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
