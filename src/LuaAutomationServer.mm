@@ -369,6 +369,10 @@ static NSData *CopyImageBGRA(UIImage *image, int *outWidth, int *outHeight) {
 }
 
 static int LuaScreenFindImage(lua_State *L) {
+    // The Lua worker's outer autorelease pool lives for the entire script.
+    // Long automation runs can call image matching hundreds of times, so drain
+    // UIKit/CoreGraphics temporaries after every call on 2 GB iPhone 6s/7.
+    @autoreleasepool {
     const char *pathCString = luaL_checkstring(L, 1);
     double similarity = luaL_optnumber(L, 2, 0.90);
     NSString *path = [[NSString stringWithUTF8String:pathCString] stringByExpandingTildeInPath];
@@ -448,9 +452,14 @@ static int LuaScreenFindImage(lua_State *L) {
     lua_pushinteger(L, llround(foundX * nativeSize.width / screenWidth));
     lua_pushinteger(L, llround(foundY * nativeSize.height / screenHeight));
     return 2;
+    }
 }
 
 static int LuaScreenOCR(lua_State *L) {
+    // Vision retains sizeable request/image intermediates until an autorelease
+    // pool drains. A per-call pool prevents a long App Store/OCR phase from
+    // exhausting memory and having iOS relaunch the Agent mid-script.
+    @autoreleasepool {
     // OCR must observe the screen at the time of the Lua call. The VNC front
     // buffer can remain unchanged when no viewer is requesting frames, which
     // made long-running scripts read text from an earlier app screen.
@@ -506,6 +515,7 @@ static int LuaScreenOCR(lua_State *L) {
     NSString *text = [lines componentsJoinedByString:@"\n"];
     lua_pushstring(L, text.UTF8String ?: "");
     return 1;
+    }
 }
 
 static int LuaAppRun(lua_State *L) {
@@ -995,7 +1005,7 @@ static std::string RunPresenceCommand(const std::string &line) {
         if (requestId.empty()) return "";
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 2.1\"}";
+            ",\"version\":\"LuaAgent 2.2\"}";
         std::string response = ApiJson(0, "Operation succeed", data);
         return "RESULT " + requestId + " " + EncodeBase64(response) + "\n";
     }
@@ -1247,7 +1257,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 2.1\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 2.2\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -1357,7 +1367,7 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
     } else if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 2.1\",\"silent_update\":true,"
+            ",\"version\":\"LuaAgent 2.2\",\"silent_update\":true,"
             "\"auto_restart\":false}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
@@ -1468,7 +1478,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 2.1\"}";
+        "\",\"tsversion\":\"LuaAgent 2.2\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
