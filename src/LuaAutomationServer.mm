@@ -672,9 +672,9 @@ static void SendRawTap(CGPoint point) {
     // TrollVNC pointer input uses explicit touch-down/lift-up events and works
     // on the same alerts, so expose that exact, proven sequence to Lua too.
     STHIDEventGenerator *generator = STHIDEventGenerator.sharedGenerator;
-    [generator touchDownAtPoints:&point touchCount:1];
+    [generator touchDown:point];
     SleepCancelable(90);
-    [generator liftUpAtPoints:&point touchCount:1];
+    [generator liftUp:point];
 }
 
 static int LuaTouchOn(lua_State *L) {
