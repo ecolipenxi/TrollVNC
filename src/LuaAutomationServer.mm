@@ -34,6 +34,15 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+// These are the exact raw touch primitives used by TrollVNC's pointer
+// handler. They intentionally omit the marker event added by the public
+// touchDown:/liftUp: helpers, because iOS 15 native permission alerts ignore
+// that convenience sequence on some iPhone 6s/7 units.
+@interface STHIDEventGenerator (LuaAgentRawTouch)
+- (void)touchDownAtPoints:(CGPoint *)locations touchCount:(NSUInteger)touchCount;
+- (void)liftUpAtPoints:(CGPoint *)locations touchCount:(NSUInteger)touchCount;
+@end
+
 extern "C" {
 #include "lauxlib.h"
 #include "lua.h"
@@ -672,9 +681,9 @@ static void SendRawTap(CGPoint point) {
     // TrollVNC pointer input uses explicit touch-down/lift-up events and works
     // on the same alerts, so expose that exact, proven sequence to Lua too.
     STHIDEventGenerator *generator = STHIDEventGenerator.sharedGenerator;
-    [generator touchDown:point];
+    [generator touchDownAtPoints:&point touchCount:1];
     SleepCancelable(90);
-    [generator liftUp:point];
+    [generator liftUpAtPoints:&point touchCount:1];
 }
 
 static int LuaTouchOn(lua_State *L) {
@@ -986,7 +995,7 @@ static std::string RunPresenceCommand(const std::string &line) {
         if (requestId.empty()) return "";
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 2.0\"}";
+            ",\"version\":\"LuaAgent 2.1\"}";
         std::string response = ApiJson(0, "Operation succeed", data);
         return "RESULT " + requestId + " " + EncodeBase64(response) + "\n";
     }
@@ -1238,7 +1247,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 2.0\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"LuaAgent 2.1\",\"port\":" + std::to_string(port) +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -1348,7 +1357,7 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
     } else if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 2.0\",\"silent_update\":true,"
+            ",\"version\":\"LuaAgent 2.1\",\"silent_update\":true,"
             "\"auto_restart\":false}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
@@ -1459,7 +1468,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 2.0\"}";
+        "\",\"tsversion\":\"LuaAgent 2.1\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
