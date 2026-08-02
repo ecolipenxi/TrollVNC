@@ -31,6 +31,7 @@
 #include <arpa/inet.h>
 #include <mach/mach.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -59,6 +60,10 @@ CFStringRef _Nullable SBSCopyFrontmostApplicationDisplayIdentifier(void);
 }
 
 namespace {
+
+constexpr char kLuaAgentVersion[] = "LuaAgent 2.3";
+constexpr char kControllerAddressPath[] =
+    "/var/mobile/Library/LuaAgent/controller-ip";
 
 struct TouchGesture {
     double x1;
@@ -90,13 +95,101 @@ std::mutex gUpdateMutex;
 std::mutex gKeepAliveMutex;
 sockaddr_in gKeepAliveTarget{};
 bool gHasKeepAliveTarget = false;
+std::atomic_bool gPowerAssertionActive{false};
+
+static void PersistControllerAddress(const sockaddr_in &peer) {
+    char address[INET_ADDRSTRLEN] = {};
+    if (!inet_ntop(AF_INET, &peer.sin_addr, address, sizeof(address))) return;
+    @autoreleasepool {
+        NSString *directory = @"/var/mobile/Library/LuaAgent";
+        [NSFileManager.defaultManager createDirectoryAtPath:directory
+                               withIntermediateDirectories:YES
+                                                attributes:nil
+                                                     error:nil];
+        NSData *data = [[NSString stringWithUTF8String:address]
+            dataUsingEncoding:NSUTF8StringEncoding];
+        [data writeToFile:[NSString stringWithUTF8String:kControllerAddressPath]
+                  options:NSDataWritingAtomic
+                    error:nil];
+    }
+}
 
 static void RememberControllerAddress(const sockaddr_in &peer) {
     if (peer.sin_family != AF_INET || peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK)) return;
-    std::lock_guard<std::mutex> lock(gKeepAliveMutex);
-    gKeepAliveTarget = peer;
-    gKeepAliveTarget.sin_port = htons(46954);
-    gHasKeepAliveTarget = true;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(gKeepAliveMutex);
+        changed = !gHasKeepAliveTarget ||
+            gKeepAliveTarget.sin_addr.s_addr != peer.sin_addr.s_addr;
+        gKeepAliveTarget = peer;
+        gKeepAliveTarget.sin_port = htons(46954);
+        gHasKeepAliveTarget = true;
+    }
+    if (changed) PersistControllerAddress(peer);
+}
+
+static void LoadRememberedControllerAddress() {
+    @autoreleasepool {
+        NSData *data = [NSData dataWithContentsOfFile:
+            [NSString stringWithUTF8String:kControllerAddressPath]];
+        if (!data.length || data.length >= INET_ADDRSTRLEN) return;
+        NSString *text = [[NSString alloc] initWithData:data
+                                                encoding:NSUTF8StringEncoding];
+        sockaddr_in peer{};
+        peer.sin_family = AF_INET;
+        if (inet_pton(AF_INET, text.UTF8String, &peer.sin_addr) != 1 ||
+            peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK)) return;
+        peer.sin_port = htons(46954);
+        std::lock_guard<std::mutex> lock(gKeepAliveMutex);
+        gKeepAliveTarget = peer;
+        gHasKeepAliveTarget = true;
+    }
+}
+
+// Keep the display dark without allowing the daemon, Wi-Fi, or Controller
+// sockets to follow it into idle system sleep. Resolve IOKit dynamically for
+// compatibility across the iOS 15-17 SDK/runtime combinations used here.
+static bool AcquireNetworkPowerAssertions() {
+    using CreateAssertionFn =
+        int32_t (*)(CFStringRef, uint32_t, CFStringRef, uint32_t *);
+    static void *ioKit = dlopen(
+        "/System/Library/Frameworks/IOKit.framework/IOKit",
+        RTLD_LAZY | RTLD_LOCAL);
+    if (!ioKit) return false;
+    auto createAssertion = reinterpret_cast<CreateAssertionFn>(
+        dlsym(ioKit, "IOPMAssertionCreateWithName"));
+    if (!createAssertion) return false;
+
+    static uint32_t userIdleAssertion = 0;
+    static uint32_t systemSleepAssertion = 0;
+    if (!userIdleAssertion) {
+        int32_t result = createAssertion(
+            CFSTR("PreventUserIdleSystemSleep"), 255,
+            CFSTR("LuaAgent Controller presence"), &userIdleAssertion);
+        if (result != 0) userIdleAssertion = 0;
+    }
+    if (!systemSleepAssertion) {
+        int32_t result = createAssertion(
+            CFSTR("PreventSystemSleep"), 255,
+            CFSTR("LuaAgent screen-off network"), &systemSleepAssertion);
+        if (result != 0) systemSleepAssertion = 0;
+    }
+    bool active = userIdleAssertion != 0 || systemSleepAssertion != 0;
+    gPowerAssertionActive.store(active);
+    return active;
+}
+
+static void RunPowerAssertionWatchdog() {
+    @autoreleasepool {
+        for (;;) {
+            if (!gPowerAssertionActive.load()) {
+                bool acquired = AcquireNetworkPowerAssertions();
+                NSLog(@"[LuaAgent] screen-off power assertion: %@",
+                      acquired ? @"active" : @"unavailable");
+            }
+            usleep(30 * 1000 * 1000);
+        }
+    }
 }
 
 static void RunControllerKeepAlive() {
@@ -1005,7 +1098,9 @@ static std::string RunPresenceCommand(const std::string &line) {
         if (requestId.empty()) return "";
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 2.2\"}";
+            ",\"version\":\"" + std::string(kLuaAgentVersion) +
+            "\",\"screen_off_keepalive\":" +
+            (gPowerAssertionActive.load() ? "true" : "false") + "}";
         std::string response = ApiJson(0, "Operation succeed", data);
         return "RESULT " + requestId + " " + EncodeBase64(response) + "\n";
     }
@@ -1059,6 +1154,19 @@ static void RunControllerPresence() {
             setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
 #ifdef SO_NOSIGPIPE
             setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+#endif
+#ifdef TCP_KEEPALIVE
+            int keepIdle = 5;
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keepIdle, sizeof(keepIdle));
+#endif
+#ifdef TCP_KEEPINTVL
+            int keepInterval = 2;
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL,
+                       &keepInterval, sizeof(keepInterval));
+#endif
+#ifdef TCP_KEEPCNT
+            int keepCount = 3;
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(keepCount));
 #endif
             timeval timeout{};
             timeout.tv_sec = 5;
@@ -1257,7 +1365,10 @@ static std::string DeviceInfoJson(uint16_t port) {
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 2.2\",\"port\":" + std::to_string(port) +
+        "\",\"tsversion\":\"" + std::string(kLuaAgentVersion) +
+        "\",\"port\":" + std::to_string(port) +
+        ",\"screen_off_keepalive\":" +
+        (gPowerAssertionActive.load() ? "true" : "false") +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
@@ -1367,7 +1478,10 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
     } else if (path == "/health") {
         std::string data = "{\"ok\":true,\"running\":" +
             std::string(gRunning.load() ? "true" : "false") +
-            ",\"version\":\"LuaAgent 2.2\",\"silent_update\":true,"
+            ",\"version\":\"" + std::string(kLuaAgentVersion) +
+            "\",\"screen_off_keepalive\":" +
+            (gPowerAssertionActive.load() ? "true" : "false") +
+            ",\"silent_update\":true,"
             "\"auto_restart\":false}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
     } else if (path == "/deviceinfo") {
@@ -1478,7 +1592,7 @@ static std::string DiscoveryJson(uint16_t apiPort) {
         ",\"devname\":\"" + JsonEscape(name) +
         "\",\"marketing_name\":\"" + JsonEscape(model) +
         "\",\"sysversion\":\"" + JsonEscape(version) +
-        "\",\"tsversion\":\"LuaAgent 2.2\"}";
+        "\",\"tsversion\":\"" + std::string(kLuaAgentVersion) + "\"}";
 }
 
 static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
@@ -1508,6 +1622,7 @@ static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
             if (length <= 0) continue;
 
             @autoreleasepool {
+                RememberControllerAddress(sender);
                 NSData *requestData = [NSData dataWithBytes:requestBytes
                                                     length:(NSUInteger)length];
                 NSError *jsonError = nil;
@@ -1532,8 +1647,11 @@ static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
 void TVStartLuaAutomationServer(uint16_t port) {
     bool expected = false;
     if (!gStarted.compare_exchange_strong(expected, true)) return;
+    LoadRememberedControllerAddress();
+    (void)AcquireNetworkPowerAssertions();
     std::thread([port] { RunServer(port); }).detach();
     std::thread([port] { RunDiscovery(46953, port); }).detach();
     std::thread([] { RunControllerKeepAlive(); }).detach();
     std::thread([] { RunControllerPresence(); }).detach();
+    std::thread([] { RunPowerAssertionWatchdog(); }).detach();
 }

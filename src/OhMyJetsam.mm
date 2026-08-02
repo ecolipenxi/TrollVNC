@@ -20,6 +20,7 @@
 #if !TARGET_OS_SIMULATOR
 
 #import <Foundation/Foundation.h>
+#include <dlfcn.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -68,12 +69,37 @@ void BypassJetsamByProcess(pid_t me, BOOL critical) {
     }
 }
 
+// The bootstrap watchdog and server must remain schedulable while the display
+// is locked; otherwise a terminated server cannot be restarted until the user
+// physically wakes the phone. Use dynamic IOKit lookup so older iOS runtimes
+// can safely fall back to the existing launchd/watchdog behavior.
+NS_INLINE
+void HoldScreenOffServicesAwake(void) {
+    using CreateAssertionFn =
+        int32_t (*)(CFStringRef, uint32_t, CFStringRef, uint32_t *);
+    void *ioKit = dlopen(
+        "/System/Library/Frameworks/IOKit.framework/IOKit",
+        RTLD_LAZY | RTLD_LOCAL);
+    if (!ioKit) return;
+    auto createAssertion = reinterpret_cast<CreateAssertionFn>(
+        dlsym(ioKit, "IOPMAssertionCreateWithName"));
+    if (!createAssertion) return;
+    static uint32_t assertionID = 0;
+    if (!assertionID) {
+        int32_t result = createAssertion(
+            CFSTR("PreventSystemSleep"), 255,
+            CFSTR("TrollVNC background service"), &assertionID);
+        if (result != 0) assertionID = 0;
+    }
+}
+
 // marked as a constructor with the highest priority
 __attribute__((constructor(101))) static void BypassJetsam(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^(void) {
         pid_t me = getpid();
         BypassJetsamByProcess(me, YES);
+        HoldScreenOffServicesAwake();
     });
 }
 
