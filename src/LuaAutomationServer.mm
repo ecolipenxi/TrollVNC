@@ -61,7 +61,7 @@ CFStringRef _Nullable SBSCopyFrontmostApplicationDisplayIdentifier(void);
 
 namespace {
 
-constexpr char kLuaAgentVersion[] = "LuaAgent 2.3";
+constexpr char kLuaAgentVersion[] = "LuaAgent 2.4";
 constexpr char kControllerAddressPath[] =
     "/var/mobile/Library/LuaAgent/controller-ip";
 
@@ -723,6 +723,153 @@ static int LuaSysRootDir(lua_State *L) {
     return 1;
 }
 
+using WallpaperSetImagesFn = int (*)(NSDictionary *, NSDictionary *, int, int);
+
+struct WallpaperApi {
+    void *foundationHandle = nullptr;
+    void *servicesHandle = nullptr;
+    Class optionsClass = Nil;
+    WallpaperSetImagesFn setImages = nullptr;
+};
+
+static WallpaperApi &GetWallpaperApi() {
+    static WallpaperApi api;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        api.foundationHandle = dlopen(
+            "/System/Library/PrivateFrameworks/SpringBoardFoundation.framework/"
+            "SpringBoardFoundation",
+            RTLD_LAZY | RTLD_LOCAL);
+        api.servicesHandle = dlopen(
+            "/System/Library/PrivateFrameworks/SpringBoardUIServices.framework/"
+            "SpringBoardUIServices",
+            RTLD_LAZY | RTLD_LOCAL);
+        if (!api.foundationHandle || !api.servicesHandle) return;
+        api.optionsClass = NSClassFromString(@"SBFWallpaperOptions");
+        api.setImages = reinterpret_cast<WallpaperSetImagesFn>(
+            dlsym(api.servicesHandle, "SBSUIWallpaperSetImages"));
+    });
+    return api;
+}
+
+static bool ConfigureWallpaperOptions(
+    id options, NSInteger mode, bool perspective, NSString *name) {
+    if (!options) return false;
+    SEL modeSelector = NSSelectorFromString(@"setWallpaperMode:");
+    if (![options respondsToSelector:modeSelector]) return false;
+    ((void (*)(id, SEL, NSInteger))objc_msgSend)(
+        options, modeSelector, mode);
+
+    SEL parallaxSelector = NSSelectorFromString(@"setParallaxFactor:");
+    if ([options respondsToSelector:parallaxSelector]) {
+        double factor = perspective ? 1.0 : 0.0;
+        ((void (*)(id, SEL, double))objc_msgSend)(
+            options, parallaxSelector, factor);
+    }
+
+    SEL nameSelector = NSSelectorFromString(@"setName:");
+    if ([options respondsToSelector:nameSelector]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(
+            options, nameSelector, name);
+    }
+    return true;
+}
+
+static bool IsAllowedWallpaperPath(NSString *path) {
+    NSString *standardized = path.stringByStandardizingPath;
+    NSString *root = @"/var/mobile/Library/LuaAgent/";
+    return [standardized hasPrefix:root] &&
+        ([standardized.pathExtension.lowercaseString isEqualToString:@"png"] ||
+         [standardized.pathExtension.lowercaseString isEqualToString:@"jpg"] ||
+         [standardized.pathExtension.lowercaseString isEqualToString:@"jpeg"] ||
+         [standardized.pathExtension.lowercaseString isEqualToString:@"heic"]);
+}
+
+static int LuaSysSetWallpaper(lua_State *L) {
+    const char *lightCString = luaL_checkstring(L, 1);
+    const char *darkCString = lua_isnoneornil(L, 2)
+        ? nullptr : luaL_checkstring(L, 2);
+    int locations = static_cast<int>(luaL_optinteger(L, 3, 3));
+    bool perspective = lua_isnoneornil(L, 4) || lua_toboolean(L, 4);
+    if (locations < 1 || locations > 3) {
+        lua_pushnil(L);
+        lua_pushstring(L, "wallpaper location must be 1, 2, or 3");
+        return 2;
+    }
+
+    @autoreleasepool {
+        NSString *lightPath = [NSString stringWithUTF8String:lightCString];
+        NSString *darkPath = darkCString
+            ? [NSString stringWithUTF8String:darkCString]
+            : lightPath;
+        if (!lightPath || !darkPath ||
+            !IsAllowedWallpaperPath(lightPath) ||
+            !IsAllowedWallpaperPath(darkPath)) {
+            lua_pushnil(L);
+            lua_pushstring(L, "wallpaper path must be an image inside LuaAgent root");
+            return 2;
+        }
+
+        UIImage *lightImage = [UIImage imageWithContentsOfFile:
+            lightPath.stringByStandardizingPath];
+        UIImage *darkImage = [UIImage imageWithContentsOfFile:
+            darkPath.stringByStandardizingPath];
+        if (!lightImage || !lightImage.CGImage ||
+            !darkImage || !darkImage.CGImage) {
+            lua_pushnil(L);
+            lua_pushstring(L, "cannot decode wallpaper image");
+            return 2;
+        }
+
+        WallpaperApi &api = GetWallpaperApi();
+        if (!api.optionsClass || !api.setImages) {
+            lua_pushnil(L);
+            lua_pushstring(L, "wallpaper service API unavailable");
+            return 2;
+        }
+
+        id lightOptions = [[api.optionsClass alloc] init];
+        id darkOptions = [[api.optionsClass alloc] init];
+        if (!ConfigureWallpaperOptions(
+                lightOptions, 1, perspective, @"LuaAgent Light") ||
+            !ConfigureWallpaperOptions(
+                darkOptions, 2, perspective, @"LuaAgent Dark")) {
+            lua_pushnil(L);
+            lua_pushstring(L, "wallpaper options API unavailable");
+            return 2;
+        }
+
+        NSDictionary *images = @{
+            @"light": lightImage,
+            @"dark": darkImage,
+        };
+        NSDictionary *options = @{
+            @"light": lightOptions,
+            @"dark": darkOptions,
+        };
+        WallpaperSetImagesFn setImages = api.setImages;
+
+        __block int result = 0;
+        void (^applyWallpaper)(void) = ^{
+            result = setImages(
+                images, options, locations,
+                static_cast<int>(UIUserInterfaceStyleDark));
+        };
+        if ([NSThread isMainThread])
+            applyWallpaper();
+        else
+            dispatch_sync(dispatch_get_main_queue(), applyWallpaper);
+
+        if (result == 0) {
+            lua_pushnil(L);
+            lua_pushstring(L, "wallpaper service rejected the image");
+            return 2;
+        }
+        lua_pushboolean(L, true);
+        return 1;
+    }
+}
+
 static int LuaAppRunShortcut(lua_State *L) {
     const char *nameCString = luaL_checkstring(L, 1);
     NSString *shortcutName = [NSString stringWithUTF8String:nameCString];
@@ -892,6 +1039,8 @@ static void RegisterFunctions(lua_State *L) {
     lua_setfield(L, -2, "input_text");
     lua_pushcfunction(L, LuaSysRootDir);
     lua_setfield(L, -2, "root_dir");
+    lua_pushcfunction(L, LuaSysSetWallpaper);
+    lua_setfield(L, -2, "set_wallpaper");
     lua_setglobal(L, "sys");
 
     lua_newtable(L);
@@ -962,6 +1111,7 @@ static void RegisterFunctions(lua_State *L) {
     Alias("app", "run_shortcut", "appRunShortcut");
     Alias("sys", "input_text", "inputText");
     Alias("sys", "root_dir", "rootDir");
+    Alias("sys", "set_wallpaper", "setWallpaper");
     Alias("sys", "toast", "toast");
 
     lua_newtable(L);
