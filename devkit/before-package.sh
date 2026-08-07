@@ -20,6 +20,7 @@ GIT_COMMIT_COUNT=$(git rev-list --count HEAD)
 # Collect executables
 cp -rp "$THEOS_STAGING_DIR/usr/bin/trollvncserver" "$THEOS_STAGING_DIR/Applications/TrollVNC.app/"
 cp -rp "$THEOS_STAGING_DIR/usr/bin/trollvncmanager" "$THEOS_STAGING_DIR/Applications/TrollVNC.app/"
+cp -rp "$THEOS_STAGING_DIR/usr/bin/trollvncwallpaper" "$THEOS_STAGING_DIR/Applications/TrollVNC.app/"
 
 # Collect bundle resources
 cp -rp "$THEOS_STAGING_DIR/Library/PreferenceBundles/TrollVNCPrefs.bundle" "$THEOS_STAGING_DIR/Applications/TrollVNC.app/"

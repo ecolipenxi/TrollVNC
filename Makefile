@@ -1,4 +1,4 @@
-export PACKAGE_VERSION := 3.4-293
+export PACKAGE_VERSION := 3.4-294
 export THEOS_PACKAGE_SCHEME
 
 ifeq ($(THEOS_DEVICE_SIMULATOR),1)
@@ -19,6 +19,24 @@ GO_EASY_ON_ME := 1
 include $(THEOS)/makefiles/common.mk
 
 TOOL_NAME += trollvncserver
+TOOL_NAME += trollvncwallpaper
+
+trollvncwallpaper_USE_MODULES := 0
+trollvncwallpaper_FILES += src/trollvncwallpaper.mm
+trollvncwallpaper_CFLAGS += -fobjc-arc
+trollvncwallpaper_CFLAGS += -Wno-unknown-warning-option
+ifeq ($(THEOS_DEVICE_SIMULATOR),)
+trollvncwallpaper_CFLAGS += -march=armv8-a+crc
+endif
+trollvncwallpaper_CCFLAGS += -std=c++20
+trollvncwallpaper_FRAMEWORKS += CoreGraphics
+trollvncwallpaper_FRAMEWORKS += Foundation
+trollvncwallpaper_FRAMEWORKS += UIKit
+ifeq ($(THEOS_DEVICE_SIMULATOR),1)
+trollvncwallpaper_CODESIGN_FLAGS += -f -s - --entitlements src/trollvncserver-simulator.entitlements
+else
+trollvncwallpaper_CODESIGN_FLAGS += -Ssrc/trollvncserver.entitlements
+endif
 
 trollvncserver_USE_MODULES := 0
 

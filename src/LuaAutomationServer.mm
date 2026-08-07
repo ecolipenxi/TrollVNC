@@ -22,6 +22,8 @@
 #include <dlfcn.h>
 #include <fstream>
 #include <mutex>
+#include <signal.h>
+#include <spawn.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -33,6 +35,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 // These are the exact raw touch primitives used by TrollVNC's pointer
@@ -59,9 +62,11 @@ int SBSOpenSensitiveURLAndUnlock(CFURLRef url, char flags);
 CFStringRef _Nullable SBSCopyFrontmostApplicationDisplayIdentifier(void);
 }
 
+extern char **environ;
+
 namespace {
 
-constexpr char kLuaAgentVersion[] = "LuaAgent 2.5";
+constexpr char kLuaAgentVersion[] = "LuaAgent 2.6";
 constexpr char kControllerAddressPath[] =
     "/var/mobile/Library/LuaAgent/controller-ip";
 
@@ -723,49 +728,6 @@ static int LuaSysRootDir(lua_State *L) {
     return 1;
 }
 
-// This single-image entry point is present on the iOS 15 devices used by the
-// controller and does not require constructing SBFWallpaperOptions.  The
-// appearance-aware SBSUIWallpaperSetImages entry point can terminate a
-// long-running VNC daemon on some iOS 15 builds, so it is intentionally not
-// called from the Agent process.
-using WallpaperSetImageForLocationsFn = CFStringRef (*)(CGImageRef, NSInteger);
-
-struct WallpaperApi {
-    void *servicesHandle = nullptr;
-    void *uiHandle = nullptr;
-    WallpaperSetImageForLocationsFn setImageForLocations = nullptr;
-};
-
-static WallpaperApi &GetWallpaperApi() {
-    static WallpaperApi api;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        api.servicesHandle = dlopen(
-            "/System/Library/PrivateFrameworks/SpringBoardUIServices.framework/"
-            "SpringBoardUIServices",
-            RTLD_LAZY | RTLD_LOCAL);
-        if (api.servicesHandle) {
-            api.setImageForLocations =
-                reinterpret_cast<WallpaperSetImageForLocationsFn>(dlsym(
-                    api.servicesHandle,
-                    "SBSUIWallpaperSetImageAsWallpaperForLocations"));
-        }
-        if (!api.setImageForLocations) {
-            api.uiHandle = dlopen(
-                "/System/Library/PrivateFrameworks/SpringBoardUI.framework/"
-                "SpringBoardUI",
-                RTLD_LAZY | RTLD_LOCAL);
-            if (api.uiHandle) {
-                api.setImageForLocations =
-                    reinterpret_cast<WallpaperSetImageForLocationsFn>(dlsym(
-                        api.uiHandle,
-                        "SBSUIWallpaperSetImageAsWallpaperForLocations"));
-            }
-        }
-    });
-    return api;
-}
-
 static bool IsAllowedWallpaperPath(NSString *path) {
     NSString *standardized = path.stringByStandardizingPath;
     NSString *root = @"/var/mobile/Library/LuaAgent/";
@@ -774,6 +736,79 @@ static bool IsAllowedWallpaperPath(NSString *path) {
          [standardized.pathExtension.lowercaseString isEqualToString:@"jpg"] ||
          [standardized.pathExtension.lowercaseString isEqualToString:@"jpeg"] ||
          [standardized.pathExtension.lowercaseString isEqualToString:@"heic"]);
+}
+
+static NSString *WallpaperHelperPath() {
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    NSString *bundlePath = NSBundle.mainBundle.bundlePath;
+    if (bundlePath.length > 0) {
+        [candidates addObject:
+            [bundlePath stringByAppendingPathComponent:@"trollvncwallpaper"]];
+    }
+    [candidates addObject:@"/var/jb/usr/bin/trollvncwallpaper"];
+    [candidates addObject:@"/usr/bin/trollvncwallpaper"];
+    for (NSString *candidate in candidates) {
+        if ([NSFileManager.defaultManager isExecutableFileAtPath:candidate])
+            return candidate;
+    }
+    return nil;
+}
+
+static bool RunWallpaperHelper(NSString *imagePath, int locations,
+                               std::string &error) {
+    NSString *helperPath = WallpaperHelperPath();
+    if (!helperPath) {
+        error = "wallpaper helper is not installed";
+        return false;
+    }
+
+    std::string helper = helperPath.UTF8String ?: "";
+    std::string image = imagePath.UTF8String ?: "";
+    std::string location = std::to_string(locations);
+    char *argv[] = {
+        const_cast<char *>(helper.c_str()),
+        const_cast<char *>(image.c_str()),
+        const_cast<char *>(location.c_str()),
+        nullptr,
+    };
+    pid_t child = 0;
+    int spawnError = posix_spawn(&child, helper.c_str(), nullptr, nullptr,
+                                 argv, environ);
+    if (spawnError != 0) {
+        error = "cannot start wallpaper helper: " +
+            std::string(strerror(spawnError));
+        return false;
+    }
+
+    int status = 0;
+    constexpr int kPolls = 80; // eight seconds, 100 ms per poll
+    for (int poll = 0; poll < kPolls; poll++) {
+        pid_t result = waitpid(child, &status, WNOHANG);
+        if (result == child) {
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return true;
+            if (WIFEXITED(status)) {
+                error = "wallpaper helper exited with code " +
+                    std::to_string(WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+                error = "wallpaper helper stopped by signal " +
+                    std::to_string(WTERMSIG(status));
+            } else {
+                error = "wallpaper helper did not complete";
+            }
+            return false;
+        }
+        if (result < 0) {
+            error = "cannot wait for wallpaper helper: " +
+                std::string(strerror(errno));
+            return false;
+        }
+        usleep(100 * 1000);
+    }
+
+    kill(child, SIGKILL);
+    waitpid(child, &status, 0);
+    error = "wallpaper helper timed out after 8 seconds";
+    return false;
 }
 
 static int LuaSysSetWallpaper(lua_State *L) {
@@ -806,37 +841,17 @@ static int LuaSysSetWallpaper(lua_State *L) {
             return 2;
         }
 
-        UIImage *lightImage = [UIImage imageWithContentsOfFile:
-            lightPath.stringByStandardizingPath];
-        if (!lightImage || !lightImage.CGImage) {
+        if (![[NSFileManager defaultManager]
+                fileExistsAtPath:lightPath.stringByStandardizingPath]) {
             lua_pushnil(L);
-            lua_pushstring(L, "cannot decode wallpaper image");
+            lua_pushstring(L, "wallpaper image does not exist");
             return 2;
         }
-
-        WallpaperApi &api = GetWallpaperApi();
-        if (!api.setImageForLocations) {
+        std::string error;
+        if (!RunWallpaperHelper(lightPath.stringByStandardizingPath,
+                                locations, error)) {
             lua_pushnil(L);
-            lua_pushstring(L,
-                           "safe wallpaper service API unavailable on this iOS version");
-            return 2;
-        }
-
-        WallpaperSetImageForLocationsFn setImageForLocations =
-            api.setImageForLocations;
-
-        __block CFStringRef result = nullptr;
-        void (^applyWallpaper)(void) = ^{
-            result = setImageForLocations(lightImage.CGImage, locations);
-        };
-        if ([NSThread isMainThread])
-            applyWallpaper();
-        else
-            dispatch_sync(dispatch_get_main_queue(), applyWallpaper);
-
-        if (!result) {
-            lua_pushnil(L);
-            lua_pushstring(L, "wallpaper service rejected the image");
+            lua_pushstring(L, error.c_str());
             return 2;
         }
         lua_pushboolean(L, true);
