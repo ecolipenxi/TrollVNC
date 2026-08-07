@@ -66,7 +66,7 @@ extern char **environ;
 
 namespace {
 
-constexpr char kLuaAgentVersion[] = "LuaAgent 2.6";
+constexpr char kLuaAgentVersion[] = "LuaAgent 2.7";
 constexpr char kControllerAddressPath[] =
     "/var/mobile/Library/LuaAgent/controller-ip";
 
