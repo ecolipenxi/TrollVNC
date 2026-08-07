@@ -61,7 +61,7 @@ CFStringRef _Nullable SBSCopyFrontmostApplicationDisplayIdentifier(void);
 
 namespace {
 
-constexpr char kLuaAgentVersion[] = "LuaAgent 2.4";
+constexpr char kLuaAgentVersion[] = "LuaAgent 2.5";
 constexpr char kControllerAddressPath[] =
     "/var/mobile/Library/LuaAgent/controller-ip";
 
@@ -723,56 +723,47 @@ static int LuaSysRootDir(lua_State *L) {
     return 1;
 }
 
-using WallpaperSetImagesFn = int (*)(NSDictionary *, NSDictionary *, int, int);
+// This single-image entry point is present on the iOS 15 devices used by the
+// controller and does not require constructing SBFWallpaperOptions.  The
+// appearance-aware SBSUIWallpaperSetImages entry point can terminate a
+// long-running VNC daemon on some iOS 15 builds, so it is intentionally not
+// called from the Agent process.
+using WallpaperSetImageForLocationsFn = CFStringRef (*)(CGImageRef, NSInteger);
 
 struct WallpaperApi {
-    void *foundationHandle = nullptr;
     void *servicesHandle = nullptr;
-    Class optionsClass = Nil;
-    WallpaperSetImagesFn setImages = nullptr;
+    void *uiHandle = nullptr;
+    WallpaperSetImageForLocationsFn setImageForLocations = nullptr;
 };
 
 static WallpaperApi &GetWallpaperApi() {
     static WallpaperApi api;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        api.foundationHandle = dlopen(
-            "/System/Library/PrivateFrameworks/SpringBoardFoundation.framework/"
-            "SpringBoardFoundation",
-            RTLD_LAZY | RTLD_LOCAL);
         api.servicesHandle = dlopen(
             "/System/Library/PrivateFrameworks/SpringBoardUIServices.framework/"
             "SpringBoardUIServices",
             RTLD_LAZY | RTLD_LOCAL);
-        if (!api.foundationHandle || !api.servicesHandle) return;
-        api.optionsClass = NSClassFromString(@"SBFWallpaperOptions");
-        api.setImages = reinterpret_cast<WallpaperSetImagesFn>(
-            dlsym(api.servicesHandle, "SBSUIWallpaperSetImages"));
+        if (api.servicesHandle) {
+            api.setImageForLocations =
+                reinterpret_cast<WallpaperSetImageForLocationsFn>(dlsym(
+                    api.servicesHandle,
+                    "SBSUIWallpaperSetImageAsWallpaperForLocations"));
+        }
+        if (!api.setImageForLocations) {
+            api.uiHandle = dlopen(
+                "/System/Library/PrivateFrameworks/SpringBoardUI.framework/"
+                "SpringBoardUI",
+                RTLD_LAZY | RTLD_LOCAL);
+            if (api.uiHandle) {
+                api.setImageForLocations =
+                    reinterpret_cast<WallpaperSetImageForLocationsFn>(dlsym(
+                        api.uiHandle,
+                        "SBSUIWallpaperSetImageAsWallpaperForLocations"));
+            }
+        }
     });
     return api;
-}
-
-static bool ConfigureWallpaperOptions(
-    id options, NSInteger mode, bool perspective, NSString *name) {
-    if (!options) return false;
-    SEL modeSelector = NSSelectorFromString(@"setWallpaperMode:");
-    if (![options respondsToSelector:modeSelector]) return false;
-    ((void (*)(id, SEL, NSInteger))objc_msgSend)(
-        options, modeSelector, mode);
-
-    SEL parallaxSelector = NSSelectorFromString(@"setParallaxFactor:");
-    if ([options respondsToSelector:parallaxSelector]) {
-        double factor = perspective ? 1.0 : 0.0;
-        ((void (*)(id, SEL, double))objc_msgSend)(
-            options, parallaxSelector, factor);
-    }
-
-    SEL nameSelector = NSSelectorFromString(@"setName:");
-    if ([options respondsToSelector:nameSelector]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(
-            options, nameSelector, name);
-    }
-    return true;
 }
 
 static bool IsAllowedWallpaperPath(NSString *path) {
@@ -790,7 +781,6 @@ static int LuaSysSetWallpaper(lua_State *L) {
     const char *darkCString = lua_isnoneornil(L, 2)
         ? nullptr : luaL_checkstring(L, 2);
     int locations = static_cast<int>(luaL_optinteger(L, 3, 3));
-    bool perspective = lua_isnoneornil(L, 4) || lua_toboolean(L, 4);
     if (locations < 1 || locations > 3) {
         lua_pushnil(L);
         lua_pushstring(L, "wallpaper location must be 1, 2, or 3");
@@ -809,58 +799,42 @@ static int LuaSysSetWallpaper(lua_State *L) {
             lua_pushstring(L, "wallpaper path must be an image inside LuaAgent root");
             return 2;
         }
+        if (darkCString && ![darkPath isEqualToString:lightPath]) {
+            lua_pushnil(L);
+            lua_pushstring(L,
+                           "appearance-aware wallpaper is unavailable in the safe Agent API");
+            return 2;
+        }
 
         UIImage *lightImage = [UIImage imageWithContentsOfFile:
             lightPath.stringByStandardizingPath];
-        UIImage *darkImage = [UIImage imageWithContentsOfFile:
-            darkPath.stringByStandardizingPath];
-        if (!lightImage || !lightImage.CGImage ||
-            !darkImage || !darkImage.CGImage) {
+        if (!lightImage || !lightImage.CGImage) {
             lua_pushnil(L);
             lua_pushstring(L, "cannot decode wallpaper image");
             return 2;
         }
 
         WallpaperApi &api = GetWallpaperApi();
-        if (!api.optionsClass || !api.setImages) {
+        if (!api.setImageForLocations) {
             lua_pushnil(L);
-            lua_pushstring(L, "wallpaper service API unavailable");
+            lua_pushstring(L,
+                           "safe wallpaper service API unavailable on this iOS version");
             return 2;
         }
 
-        id lightOptions = [[api.optionsClass alloc] init];
-        id darkOptions = [[api.optionsClass alloc] init];
-        if (!ConfigureWallpaperOptions(
-                lightOptions, 1, perspective, @"LuaAgent Light") ||
-            !ConfigureWallpaperOptions(
-                darkOptions, 2, perspective, @"LuaAgent Dark")) {
-            lua_pushnil(L);
-            lua_pushstring(L, "wallpaper options API unavailable");
-            return 2;
-        }
+        WallpaperSetImageForLocationsFn setImageForLocations =
+            api.setImageForLocations;
 
-        NSDictionary *images = @{
-            @"light": lightImage,
-            @"dark": darkImage,
-        };
-        NSDictionary *options = @{
-            @"light": lightOptions,
-            @"dark": darkOptions,
-        };
-        WallpaperSetImagesFn setImages = api.setImages;
-
-        __block int result = 0;
+        __block CFStringRef result = nullptr;
         void (^applyWallpaper)(void) = ^{
-            result = setImages(
-                images, options, locations,
-                static_cast<int>(UIUserInterfaceStyleDark));
+            result = setImageForLocations(lightImage.CGImage, locations);
         };
         if ([NSThread isMainThread])
             applyWallpaper();
         else
             dispatch_sync(dispatch_get_main_queue(), applyWallpaper);
 
-        if (result == 0) {
+        if (!result) {
             lua_pushnil(L);
             lua_pushstring(L, "wallpaper service rejected the image");
             return 2;
