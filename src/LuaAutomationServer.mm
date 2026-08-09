@@ -10,6 +10,7 @@
 
 #import <UIKit/UIKit.h>
 #import <Vision/Vision.h>
+#import <notify.h>
 #import <objc/message.h>
 
 #include <algorithm>
@@ -467,6 +468,35 @@ static bool ReadSASSystemScreenOn(bool &screenOn, int *status = nullptr) {
     }
 }
 
+static bool ReadBlankedScreenNotification(bool &screenOn, int *status = nullptr,
+                                          uint64_t *rawState = nullptr) {
+    if (status) *status = -40;
+    static int token = 0;
+    static uint32_t registrationStatus = 1;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        registrationStatus = notify_register_check(
+            "com.apple.springboard.hasBlankedScreen", &token);
+    });
+    if (registrationStatus != NOTIFY_STATUS_OK) {
+        if (status) *status = -40;
+        return false;
+    }
+
+    uint64_t state = 0;
+    uint32_t readStatus = notify_get_state(token, &state);
+    if (readStatus != NOTIFY_STATUS_OK) {
+        if (status) *status = -41;
+        return false;
+    }
+    if (rawState) *rawState = state;
+    // This is the same Darwin state used by WorkflowKit's
+    // WFScreenOnObserver: zero means the panel is not blanked.
+    screenOn = state == 0;
+    if (status) *status = 0;
+    return true;
+}
+
 static bool ReadScreenOn(bool &screenOn, std::string *source = nullptr) {
     if (source) source->clear();
     long long displayBacklight = 0;
@@ -475,12 +505,8 @@ static bool ReadScreenOn(bool &screenOn, std::string *source = nullptr) {
         if (source) *source = "fbs_display_layout";
         return true;
     }
-    if (ReadSASLockScreenOn(screenOn)) {
-        if (source) *source = "sas_lock_monitor";
-        return true;
-    }
-    if (ReadSASSystemScreenOn(screenOn)) {
-        if (source) *source = "sas_system_state";
+    if (ReadBlankedScreenNotification(screenOn)) {
+        if (source) *source = "springboard_blanked_notify";
         return true;
     }
     float backlight = 0.0f;
@@ -1699,13 +1725,12 @@ static std::string DeviceInfoJson(uint16_t port) {
     long long displayBacklightLevel = -1;
     float sbsBacklightFactor = -1.0f;
     int fbsStatus = -1;
-    int sasLockStatus = -1;
-    int sasSystemStatus = -1;
-    bool sasLockScreenOn = false;
-    bool sasSystemScreenOn = false;
+    int blankedNotifyStatus = -1;
+    bool blankedNotifyScreenOn = false;
+    uint64_t blankedNotifyState = 0;
     bool fbsKnown = ReadDisplayBacklightLevel(displayBacklightLevel, &fbsStatus);
-    bool sasLockKnown = ReadSASLockScreenOn(sasLockScreenOn, &sasLockStatus);
-    bool sasSystemKnown = ReadSASSystemScreenOn(sasSystemScreenOn, &sasSystemStatus);
+    bool blankedNotifyKnown = ReadBlankedScreenNotification(
+        blankedNotifyScreenOn, &blankedNotifyStatus, &blankedNotifyState);
     ReadBacklightFactor(sbsBacklightFactor);
     std::string frontmostApp = ReadFrontmostApplication();
     bool homeReadyKnown = screenOnKnown && lockedKnown;
@@ -1734,12 +1759,11 @@ static std::string DeviceInfoJson(uint16_t port) {
         ",\"fbs_backlight_known\":" + (fbsKnown ? "true" : "false") +
         ",\"display_backlight_level\":" + std::to_string(displayBacklightLevel) +
         ",\"sbs_backlight_factor\":" + std::to_string(sbsBacklightFactor) +
-        ",\"sas_lock_status\":" + std::to_string(sasLockStatus) +
-        ",\"sas_lock_screen_on\":" +
-        (sasLockKnown ? (sasLockScreenOn ? "true" : "false") : "null") +
-        ",\"sas_system_status\":" + std::to_string(sasSystemStatus) +
-        ",\"sas_system_screen_on\":" +
-        (sasSystemKnown ? (sasSystemScreenOn ? "true" : "false") : "null") +
+        ",\"blanked_notify_status\":" + std::to_string(blankedNotifyStatus) +
+        ",\"blanked_notify_state\":" +
+        (blankedNotifyKnown ? std::to_string(blankedNotifyState) : "null") +
+        ",\"blanked_notify_screen_on\":" +
+        (blankedNotifyKnown ? (blankedNotifyScreenOn ? "true" : "false") : "null") +
         ",\"locked\":" +
         (lockedKnown ? (locked ? "true" : "false") : "null") +
         ",\"frontmost_app\":\"" + JsonEscape(frontmostApp) +
