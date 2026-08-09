@@ -680,3 +680,15 @@ If you prefer, you can always build TrollVNC yourself directly from the source.
 - Pay for convenience, updates, and support.
 
 Support TrollVNC and help us keep remote access fast, secure, and evolving.
+
+## LuaAgent 3.1 automation additions
+
+Lua scripts may use `clipboard.get()`, `clipboard.set(text)`, and
+`clipboard.clear()`. Clipboard access is deliberately local to the Lua state;
+the Agent does not expose a clipboard HTTP endpoint.
+
+Structured, allow-listed automation results can be written with
+`point.report(event, detail)`. The event name is limited to uppercase letters,
+digits, and underscore (40 characters); detail is limited to 2048 bytes and
+line breaks are removed. Events appear in `/status` and `/logs` as
+`[TIKTOK_POINT] EVENT|<event>|<detail>`.
