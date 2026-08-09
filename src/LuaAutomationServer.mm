@@ -5,6 +5,7 @@
  */
 
 #import "LuaAutomationServer.h"
+#import "ClipboardManager.h"
 #import "STHIDEventGenerator.h"
 #import "TVFrameSnapshot.h"
 
@@ -67,7 +68,7 @@ extern char **environ;
 
 namespace {
 
-constexpr char kLuaAgentVersion[] = "LuaAgent 3.0";
+constexpr char kLuaAgentVersion[] = "LuaAgent 3.1";
 constexpr char kControllerAddressPath[] =
     "/var/mobile/Library/LuaAgent/controller-ip";
 
@@ -643,6 +644,105 @@ static int LuaLog(lua_State *L) {
     }
     lua_pop(L, 1);
     return 0;
+}
+
+static NSString *ClipboardStringOnMainThread() {
+    __block NSString *text = nil;
+    void (^readBlock)(void) = ^{
+        text = [ClipboardManager.sharedManager currentString];
+    };
+    if ([NSThread isMainThread])
+        readBlock();
+    else
+        dispatch_sync(dispatch_get_main_queue(), readBlock);
+    return text;
+}
+
+static void SetClipboardStringOnMainThread(NSString *text) {
+    void (^writeBlock)(void) = ^{
+        [ClipboardManager.sharedManager setString:text ?: @""];
+    };
+    if ([NSThread isMainThread])
+        writeBlock();
+    else
+        dispatch_sync(dispatch_get_main_queue(), writeBlock);
+}
+
+// Clipboard access stays inside the Lua process.  There is intentionally no
+// unauthenticated HTTP clipboard endpoint exposed to the LAN.
+static int LuaClipboardGet(lua_State *L) {
+    @autoreleasepool {
+        NSString *text = ClipboardStringOnMainThread();
+        if (text.length == 0) {
+            lua_pushnil(L);
+            return 1;
+        }
+        NSData *utf8 = [text dataUsingEncoding:NSUTF8StringEncoding];
+        if (!utf8) {
+            lua_pushnil(L);
+            return 1;
+        }
+        lua_pushlstring(L, static_cast<const char *>(utf8.bytes), utf8.length);
+        return 1;
+    }
+}
+
+static int LuaClipboardSet(lua_State *L) {
+    size_t length = 0;
+    const char *bytes = luaL_checklstring(L, 1, &length);
+    if (length > 64 * 1024)
+        return luaL_error(L, "clipboard text exceeds 65536 bytes");
+    @autoreleasepool {
+        NSString *text = [[NSString alloc] initWithBytes:bytes
+                                                   length:length
+                                                 encoding:NSUTF8StringEncoding];
+        if (!text) {
+            lua_pushboolean(L, false);
+            lua_pushstring(L, "clipboard text is not valid UTF-8");
+            return 2;
+        }
+        SetClipboardStringOnMainThread(text);
+        lua_pushboolean(L, true);
+        return 1;
+    }
+}
+
+static int LuaClipboardClear(lua_State *L) {
+    SetClipboardStringOnMainThread(@"");
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+static bool IsSafePointEventName(const std::string &name) {
+    if (name.empty() || name.size() > 40) return false;
+    return std::all_of(name.begin(), name.end(), [](unsigned char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+    });
+}
+
+static int LuaPointReport(lua_State *L) {
+    size_t eventLength = 0;
+    const char *eventBytes = luaL_checklstring(L, 1, &eventLength);
+    size_t detailLength = 0;
+    const char *detailBytes = luaL_optlstring(L, 2, "", &detailLength);
+    std::string eventName(eventBytes, eventLength);
+    if (!IsSafePointEventName(eventName))
+        return luaL_error(L, "point event must use 1-40 uppercase letters, digits, or underscore");
+    if (detailLength > 2048)
+        return luaL_error(L, "point event detail exceeds 2048 bytes");
+
+    std::string detail(detailBytes, detailLength);
+    std::replace(detail.begin(), detail.end(), '\r', ' ');
+    std::replace(detail.begin(), detail.end(), '\n', ' ');
+    std::string line = "[TIKTOK_POINT] EVENT|" + eventName + "|" + detail;
+    NSLog(@"[LuaAgent] %s", line.c_str());
+    {
+        std::lock_guard<std::mutex> lock(gStatusMutex);
+        gRecentLogs.emplace_back(line);
+        if (gRecentLogs.size() > 200) gRecentLogs.erase(gRecentLogs.begin());
+    }
+    lua_pushboolean(L, true);
+    return 1;
 }
 
 static int LuaScreenInit(lua_State *) {
@@ -1292,6 +1392,20 @@ static void RegisterFunctions(lua_State *L) {
     lua_setglobal(L, "nLog");
 
     lua_newtable(L);
+    lua_pushcfunction(L, LuaClipboardGet);
+    lua_setfield(L, -2, "get");
+    lua_pushcfunction(L, LuaClipboardSet);
+    lua_setfield(L, -2, "set");
+    lua_pushcfunction(L, LuaClipboardClear);
+    lua_setfield(L, -2, "clear");
+    lua_setglobal(L, "clipboard");
+
+    lua_newtable(L);
+    lua_pushcfunction(L, LuaPointReport);
+    lua_setfield(L, -2, "report");
+    lua_setglobal(L, "point");
+
+    lua_newtable(L);
     lua_pushcfunction(L, LuaAppRun);
     lua_setfield(L, -2, "run");
     lua_pushcfunction(L, LuaAppRun);
@@ -1325,6 +1439,9 @@ static void RegisterFunctions(lua_State *L) {
     Alias("sys", "root_dir", "rootDir");
     Alias("sys", "set_wallpaper", "setWallpaper");
     Alias("sys", "toast", "toast");
+    Alias("clipboard", "get", "getClipboard");
+    Alias("clipboard", "set", "setClipboard");
+    Alias("clipboard", "clear", "clearClipboard");
 
     lua_newtable(L);
     lua_pushcfunction(L, LuaDeviceIsScreenOn);
