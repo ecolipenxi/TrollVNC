@@ -66,7 +66,7 @@ extern char **environ;
 
 namespace {
 
-constexpr char kLuaAgentVersion[] = "LuaAgent 2.7";
+constexpr char kLuaAgentVersion[] = "LuaAgent 2.8";
 constexpr char kControllerAddressPath[] =
     "/var/mobile/Library/LuaAgent/controller-ip";
 
@@ -321,6 +321,31 @@ static bool ReadScreenOn(bool &screenOn) {
     api.lockStatus(api.serverPort(), &locked, &passcode);
     screenOn = !locked;
     return true;
+}
+
+static bool ReadScreenLocked(bool &locked) {
+    auto &api = ScreenApi();
+    if (!api.serverPort || !api.lockStatus) return false;
+    Boolean screenLocked = false;
+    Boolean passcode = false;
+    api.lockStatus(api.serverPort(), &screenLocked, &passcode);
+    locked = screenLocked;
+    return true;
+}
+
+static std::string ReadFrontmostApplication() {
+    @autoreleasepool {
+        CFStringRef frontmostRef = SBSCopyFrontmostApplicationDisplayIdentifier();
+        if (!frontmostRef) return "";
+        NSString *frontmost = CFBridgingRelease(frontmostRef);
+        return frontmost.UTF8String ?: "";
+    }
+}
+
+static bool IsHomeFrontmostApplication(const std::string &frontmost) {
+    // SpringBoard returns either its own bundle identifier or nil while the
+    // icon grid is frontmost, depending on the iOS 15 point release/device.
+    return frontmost.empty() || frontmost == "com.apple.springboard";
 }
 
 static int LuaDeviceIsScreenOn(lua_State *L) {
@@ -1493,6 +1518,13 @@ static std::string DeviceInfoJson(uint16_t port) {
     double startedAt;
     double finishedAt;
     bool stoppedByUser;
+    bool screenOn = false;
+    bool locked = false;
+    bool screenOnKnown = ReadScreenOn(screenOn);
+    bool lockedKnown = ReadScreenLocked(locked);
+    std::string frontmostApp = ReadFrontmostApplication();
+    bool homeReady = screenOnKnown && screenOn && lockedKnown && !locked &&
+        IsHomeFrontmostApplication(frontmostApp);
     {
         std::lock_guard<std::mutex> lock(gStatusMutex);
         lastError = gLastError;
@@ -1508,6 +1540,12 @@ static std::string DeviceInfoJson(uint16_t port) {
         "\",\"port\":" + std::to_string(port) +
         ",\"screen_off_keepalive\":" +
         (gPowerAssertionActive.load() ? "true" : "false") +
+        ",\"screen_on\":" +
+        (screenOnKnown ? (screenOn ? "true" : "false") : "null") +
+        ",\"locked\":" +
+        (lockedKnown ? (locked ? "true" : "false") : "null") +
+        ",\"frontmost_app\":\"" + JsonEscape(frontmostApp) +
+        "\",\"home_ready\":" + (homeReady ? "true" : "false") +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
