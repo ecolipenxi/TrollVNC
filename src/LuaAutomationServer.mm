@@ -66,7 +66,7 @@ extern char **environ;
 
 namespace {
 
-constexpr char kLuaAgentVersion[] = "LuaAgent 2.9";
+constexpr char kLuaAgentVersion[] = "LuaAgent 3.0";
 constexpr char kControllerAddressPath[] =
     "/var/mobile/Library/LuaAgent/controller-ip";
 
@@ -308,57 +308,191 @@ static bool ReadBacklightFactor(float &factor) {
     return std::isfinite(factor) && factor >= 0.0f && factor <= 1.5f;
 }
 
-static bool ReadDisplayBacklightLevel(long long &level) {
+static bool ReadDisplayBacklightLevel(long long &level, int *status = nullptr) {
     @autoreleasepool {
+        if (status) *status = -1;
         // SBGetCurrentBacklightFactor is stale (always 0) from TrollVNC's
         // daemon process on a subset of iOS 15 iPhone 6s/7 devices.  The
         // FrontBoard display layout is the source SpringBoard itself uses and
         // keeps tracking the physical panel while this process stays alive.
-        static Class monitorClass = Nil;
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-            dlopen(
-                "/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices",
-                RTLD_LAZY | RTLD_LOCAL);
-            monitorClass = NSClassFromString(@"FBSDisplayLayoutMonitor");
-        });
+        @try {
+            static Class monitorClass = Nil;
+            static int loadStatus = -10;
+            static dispatch_once_t onceToken;
+            dispatch_once(&onceToken, ^{
+                void *handle = dlopen(
+                    "/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices",
+                    RTLD_LAZY | RTLD_LOCAL);
+                if (!handle) {
+                    loadStatus = -10;
+                    return;
+                }
+                monitorClass = NSClassFromString(@"FBSDisplayLayoutMonitor");
+                loadStatus = monitorClass ? 0 : -11;
+            });
+            if (!monitorClass) {
+                if (status) *status = loadStatus;
+                return false;
+            }
 
-        SEL sharedSelector = NSSelectorFromString(@"sharedMonitorForDisplayType:");
-        SEL layoutSelector = NSSelectorFromString(@"currentLayout");
-        SEL levelSelector = NSSelectorFromString(@"displayBacklightLevel");
-        if (!monitorClass || ![monitorClass respondsToSelector:sharedSelector]) return false;
+            SEL sharedSelector = NSSelectorFromString(@"sharedMonitorForDisplayType:");
+            SEL layoutSelector = NSSelectorFromString(@"currentLayout");
+            SEL levelSelector = NSSelectorFromString(@"displayBacklightLevel");
+            if (![monitorClass respondsToSelector:sharedSelector]) {
+                if (status) *status = -12;
+                return false;
+            }
 
-        id monitor = ((id (*)(id, SEL, long long))objc_msgSend)(
-            monitorClass, sharedSelector, 0LL);
-        if (!monitor || ![monitor respondsToSelector:layoutSelector]) return false;
-        id layout = ((id (*)(id, SEL))objc_msgSend)(monitor, layoutSelector);
-        if (!layout || ![layout respondsToSelector:levelSelector]) return false;
+            id monitor = ((id (*)(id, SEL, long long))objc_msgSend)(
+                monitorClass, sharedSelector, 0LL);
+            if (!monitor) {
+                if (status) *status = -13;
+                return false;
+            }
+            if (![monitor respondsToSelector:layoutSelector]) {
+                if (status) *status = -14;
+                return false;
+            }
+            id layout = ((id (*)(id, SEL))objc_msgSend)(monitor, layoutSelector);
+            if (!layout) {
+                if (status) *status = -15;
+                return false;
+            }
+            if (![layout respondsToSelector:levelSelector]) {
+                if (status) *status = -16;
+                return false;
+            }
 
-        long long value = ((long long (*)(id, SEL))objc_msgSend)(layout, levelSelector);
-        if (value < 0 || value > 10000) return false;
-        level = value;
-        return true;
+            long long value = ((long long (*)(id, SEL))objc_msgSend)(layout, levelSelector);
+            if (value < 0 || value > 10000) {
+                if (status) *status = -17;
+                return false;
+            }
+            level = value;
+            if (status) *status = 0;
+            return true;
+        } @catch (NSException *exception) {
+            if (status) *status = -18;
+            return false;
+        }
     }
 }
 
-static bool ReadScreenOn(bool &screenOn) {
-    auto &api = ScreenApi();
+static bool ReadSASLockScreenOn(bool &screenOn, int *status = nullptr) {
+    @autoreleasepool {
+        if (status) *status = -20;
+        @try {
+            static id monitor = nil;
+            static int initStatus = -20;
+            static dispatch_once_t onceToken;
+            dispatch_once(&onceToken, ^{
+                void *handle = dlopen(
+                    "/System/Library/PrivateFrameworks/SiriActivation.framework/SiriActivation",
+                    RTLD_LAZY | RTLD_LOCAL);
+                if (!handle) {
+                    initStatus = -20;
+                    return;
+                }
+                Class monitorClass = NSClassFromString(@"SASLockStateMonitor");
+                if (!monitorClass) {
+                    initStatus = -21;
+                    return;
+                }
+                monitor = [[monitorClass alloc] init];
+                initStatus = monitor ? 0 : -22;
+            });
+            if (!monitor) {
+                if (status) *status = initStatus;
+                return false;
+            }
+            SEL selector = NSSelectorFromString(@"isScreenOn");
+            if (![monitor respondsToSelector:selector]) {
+                if (status) *status = -23;
+                return false;
+            }
+            screenOn = ((BOOL (*)(id, SEL))objc_msgSend)(monitor, selector);
+            if (status) *status = 0;
+            return true;
+        } @catch (NSException *exception) {
+            if (status) *status = -24;
+            return false;
+        }
+    }
+}
+
+static bool ReadSASSystemScreenOn(bool &screenOn, int *status = nullptr) {
+    @autoreleasepool {
+        if (status) *status = -30;
+        @try {
+            static Class systemStateClass = Nil;
+            static int loadStatus = -30;
+            static dispatch_once_t onceToken;
+            dispatch_once(&onceToken, ^{
+                void *handle = dlopen(
+                    "/System/Library/PrivateFrameworks/SiriActivation.framework/SiriActivation",
+                    RTLD_LAZY | RTLD_LOCAL);
+                if (!handle) {
+                    loadStatus = -30;
+                    return;
+                }
+                systemStateClass = NSClassFromString(@"SASSystemState");
+                loadStatus = systemStateClass ? 0 : -31;
+            });
+            if (!systemStateClass) {
+                if (status) *status = loadStatus;
+                return false;
+            }
+            SEL sharedSelector = NSSelectorFromString(@"sharedSystemState");
+            if (![systemStateClass respondsToSelector:sharedSelector]) {
+                if (status) *status = -32;
+                return false;
+            }
+            id state = ((id (*)(id, SEL))objc_msgSend)(systemStateClass, sharedSelector);
+            if (!state) {
+                if (status) *status = -33;
+                return false;
+            }
+            SEL screenSelector = NSSelectorFromString(@"deviceScreenIsOn");
+            if (![state respondsToSelector:screenSelector]) {
+                if (status) *status = -34;
+                return false;
+            }
+            screenOn = ((BOOL (*)(id, SEL))objc_msgSend)(state, screenSelector);
+            if (status) *status = 0;
+            return true;
+        } @catch (NSException *exception) {
+            if (status) *status = -35;
+            return false;
+        }
+    }
+}
+
+static bool ReadScreenOn(bool &screenOn, std::string *source = nullptr) {
+    if (source) source->clear();
     long long displayBacklight = 0;
     if (ReadDisplayBacklightLevel(displayBacklight)) {
         screenOn = displayBacklight > 0;
+        if (source) *source = "fbs_display_layout";
+        return true;
+    }
+    if (ReadSASLockScreenOn(screenOn)) {
+        if (source) *source = "sas_lock_monitor";
+        return true;
+    }
+    if (ReadSASSystemScreenOn(screenOn)) {
+        if (source) *source = "sas_system_state";
         return true;
     }
     float backlight = 0.0f;
-    if (ReadBacklightFactor(backlight)) {
-        screenOn = backlight > 0.01f;
+    // From a root daemon SBGetCurrentBacklightFactor can be stale at exactly
+    // zero.  A positive value is trustworthy; zero is reported as unknown so
+    // wake() never toggles an already-lit panel off based on stale data.
+    if (ReadBacklightFactor(backlight) && backlight > 0.01f) {
+        screenOn = true;
+        if (source) *source = "sbs_positive_backlight";
         return true;
     }
-    if (!api.serverPort || !api.lockStatus) return false;
-    Boolean locked = false;
-    Boolean passcode = false;
-    api.lockStatus(api.serverPort(), &locked, &passcode);
-    screenOn = !locked;
-    return true;
+    return false;
 }
 
 static bool ReadScreenLocked(bool &locked) {
@@ -1559,14 +1693,23 @@ static std::string DeviceInfoJson(uint16_t port) {
     bool stoppedByUser;
     bool screenOn = false;
     bool locked = false;
-    bool screenOnKnown = ReadScreenOn(screenOn);
+    std::string screenStateSource;
+    bool screenOnKnown = ReadScreenOn(screenOn, &screenStateSource);
     bool lockedKnown = ReadScreenLocked(locked);
     long long displayBacklightLevel = -1;
     float sbsBacklightFactor = -1.0f;
-    ReadDisplayBacklightLevel(displayBacklightLevel);
+    int fbsStatus = -1;
+    int sasLockStatus = -1;
+    int sasSystemStatus = -1;
+    bool sasLockScreenOn = false;
+    bool sasSystemScreenOn = false;
+    bool fbsKnown = ReadDisplayBacklightLevel(displayBacklightLevel, &fbsStatus);
+    bool sasLockKnown = ReadSASLockScreenOn(sasLockScreenOn, &sasLockStatus);
+    bool sasSystemKnown = ReadSASSystemScreenOn(sasSystemScreenOn, &sasSystemStatus);
     ReadBacklightFactor(sbsBacklightFactor);
     std::string frontmostApp = ReadFrontmostApplication();
-    bool homeReady = screenOnKnown && screenOn && lockedKnown && !locked &&
+    bool homeReadyKnown = screenOnKnown && lockedKnown;
+    bool homeReady = homeReadyKnown && screenOn && !locked &&
         IsHomeFrontmostApplication(frontmostApp);
     {
         std::lock_guard<std::mutex> lock(gStatusMutex);
@@ -1586,12 +1729,22 @@ static std::string DeviceInfoJson(uint16_t port) {
         (gPowerAssertionActive.load() ? "true" : "false") +
         ",\"screen_on\":" +
         (screenOnKnown ? (screenOn ? "true" : "false") : "null") +
+        ",\"screen_state_source\":\"" + JsonEscape(screenStateSource) +
+        "\",\"fbs_status\":" + std::to_string(fbsStatus) +
+        ",\"fbs_backlight_known\":" + (fbsKnown ? "true" : "false") +
         ",\"display_backlight_level\":" + std::to_string(displayBacklightLevel) +
         ",\"sbs_backlight_factor\":" + std::to_string(sbsBacklightFactor) +
+        ",\"sas_lock_status\":" + std::to_string(sasLockStatus) +
+        ",\"sas_lock_screen_on\":" +
+        (sasLockKnown ? (sasLockScreenOn ? "true" : "false") : "null") +
+        ",\"sas_system_status\":" + std::to_string(sasSystemStatus) +
+        ",\"sas_system_screen_on\":" +
+        (sasSystemKnown ? (sasSystemScreenOn ? "true" : "false") : "null") +
         ",\"locked\":" +
         (lockedKnown ? (locked ? "true" : "false") : "null") +
         ",\"frontmost_app\":\"" + JsonEscape(frontmostApp) +
-        "\",\"home_ready\":" + (homeReady ? "true" : "false") +
+        "\",\"home_ready\":" +
+        (homeReadyKnown ? (homeReady ? "true" : "false") : "null") +
         ",\"is_running\":" + (gRunning.load() ? "true" : "false") +
         ",\"run_id\":\"" + JsonEscape(runId) +
         "\",\"started_at\":" + std::to_string(startedAt) +
