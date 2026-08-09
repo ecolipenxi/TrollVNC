@@ -66,7 +66,7 @@ extern char **environ;
 
 namespace {
 
-constexpr char kLuaAgentVersion[] = "LuaAgent 2.8";
+constexpr char kLuaAgentVersion[] = "LuaAgent 2.9";
 constexpr char kControllerAddressPath[] =
     "/var/mobile/Library/LuaAgent/controller-ip";
 
@@ -308,8 +308,46 @@ static bool ReadBacklightFactor(float &factor) {
     return std::isfinite(factor) && factor >= 0.0f && factor <= 1.5f;
 }
 
+static bool ReadDisplayBacklightLevel(long long &level) {
+    @autoreleasepool {
+        // SBGetCurrentBacklightFactor is stale (always 0) from TrollVNC's
+        // daemon process on a subset of iOS 15 iPhone 6s/7 devices.  The
+        // FrontBoard display layout is the source SpringBoard itself uses and
+        // keeps tracking the physical panel while this process stays alive.
+        static Class monitorClass = Nil;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            dlopen(
+                "/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices",
+                RTLD_LAZY | RTLD_LOCAL);
+            monitorClass = NSClassFromString(@"FBSDisplayLayoutMonitor");
+        });
+
+        SEL sharedSelector = NSSelectorFromString(@"sharedMonitorForDisplayType:");
+        SEL layoutSelector = NSSelectorFromString(@"currentLayout");
+        SEL levelSelector = NSSelectorFromString(@"displayBacklightLevel");
+        if (!monitorClass || ![monitorClass respondsToSelector:sharedSelector]) return false;
+
+        id monitor = ((id (*)(id, SEL, long long))objc_msgSend)(
+            monitorClass, sharedSelector, 0LL);
+        if (!monitor || ![monitor respondsToSelector:layoutSelector]) return false;
+        id layout = ((id (*)(id, SEL))objc_msgSend)(monitor, layoutSelector);
+        if (!layout || ![layout respondsToSelector:levelSelector]) return false;
+
+        long long value = ((long long (*)(id, SEL))objc_msgSend)(layout, levelSelector);
+        if (value < 0 || value > 10000) return false;
+        level = value;
+        return true;
+    }
+}
+
 static bool ReadScreenOn(bool &screenOn) {
     auto &api = ScreenApi();
+    long long displayBacklight = 0;
+    if (ReadDisplayBacklightLevel(displayBacklight)) {
+        screenOn = displayBacklight > 0;
+        return true;
+    }
     float backlight = 0.0f;
     if (ReadBacklightFactor(backlight)) {
         screenOn = backlight > 0.01f;
@@ -373,13 +411,13 @@ static int LuaDeviceWake(lua_State *L) {
     usleep(180 * 1000);
     api.undim();
 
-    float backlight = 0.0f;
-    if (ReadBacklightFactor(backlight) && backlight <= 0.01f) {
+    bool screenOn = false;
+    if (ReadScreenOn(screenOn) && !screenOn) {
         [STHIDEventGenerator.sharedGenerator powerPress];
         usleep(450 * 1000);
         api.undim();
         usleep(180 * 1000);
-        if (ReadBacklightFactor(backlight) && backlight <= 0.01f) {
+        if (ReadScreenOn(screenOn) && !screenOn) {
             lua_pushnil(L);
             lua_pushstring(L, "panel remained dark after wake request");
             return 2;
@@ -1513,6 +1551,7 @@ static std::string DeviceInfoJson(uint16_t port) {
     UIDevice *device = UIDevice.currentDevice;
     std::string name = device.name.UTF8String ?: "iPhone";
     std::string version = device.systemVersion.UTF8String ?: "";
+    std::string deviceId = device.identifierForVendor.UUIDString.UTF8String ?: "";
     std::string lastError;
     std::string runId;
     double startedAt;
@@ -1522,6 +1561,10 @@ static std::string DeviceInfoJson(uint16_t port) {
     bool locked = false;
     bool screenOnKnown = ReadScreenOn(screenOn);
     bool lockedKnown = ReadScreenLocked(locked);
+    long long displayBacklightLevel = -1;
+    float sbsBacklightFactor = -1.0f;
+    ReadDisplayBacklightLevel(displayBacklightLevel);
+    ReadBacklightFactor(sbsBacklightFactor);
     std::string frontmostApp = ReadFrontmostApplication();
     bool homeReady = screenOnKnown && screenOn && lockedKnown && !locked &&
         IsHomeFrontmostApplication(frontmostApp);
@@ -1534,6 +1577,7 @@ static std::string DeviceInfoJson(uint16_t port) {
         stoppedByUser = gStoppedByUser;
     }
     std::string data = "{\"devname\":\"" + JsonEscape(name) +
+        "\",\"deviceid\":\"" + JsonEscape(deviceId) +
         "\",\"marketing_name\":\"" + JsonEscape(device.model.UTF8String ?: "iPhone") +
         "\",\"sysversion\":\"" + JsonEscape(version) +
         "\",\"tsversion\":\"" + std::string(kLuaAgentVersion) +
@@ -1542,6 +1586,8 @@ static std::string DeviceInfoJson(uint16_t port) {
         (gPowerAssertionActive.load() ? "true" : "false") +
         ",\"screen_on\":" +
         (screenOnKnown ? (screenOn ? "true" : "false") : "null") +
+        ",\"display_backlight_level\":" + std::to_string(displayBacklightLevel) +
+        ",\"sbs_backlight_factor\":" + std::to_string(sbsBacklightFactor) +
         ",\"locked\":" +
         (lockedKnown ? (locked ? "true" : "false") : "null") +
         ",\"frontmost_app\":\"" + JsonEscape(frontmostApp) +
