@@ -5,6 +5,7 @@
  */
 
 #import "LuaAutomationServer.h"
+#import "LiveControl.h"
 #import "ClipboardManager.h"
 #import "STHIDEventGenerator.h"
 #import "TVFrameSnapshot.h"
@@ -68,7 +69,8 @@ extern char **environ;
 
 namespace {
 
-constexpr char kLuaAgentVersion[] = "LuaAgent 3.1";
+constexpr char kLuaAgentVersion[] = "LuaAgent 3.2";
+std::atomic_bool gLiveInput{false};
 constexpr char kControllerAddressPath[] =
     "/var/mobile/Library/LuaAgent/controller-ip";
 
@@ -1481,11 +1483,13 @@ static void StopScript() {
 struct StartResult {
     std::string runId;
     bool duplicate;
+    bool busy = false;
 };
 
 static StartResult StartScript(
     const std::string &script, const std::string &requestId) {
     std::lock_guard<std::mutex> spawnLock(gSpawnMutex);
+    if (gLiveInput.load()) return {"", false, true};
     if (!requestId.empty()) {
         std::lock_guard<std::mutex> statusLock(gStatusMutex);
         for (const auto &entry : gRecentRequests) {
@@ -1600,7 +1604,7 @@ static std::string RunPresenceCommand(const std::string &line) {
             std::string data = "{\"run_id\":\"" + JsonEscape(result.runId) +
                 "\",\"duplicate\":" + (result.duplicate ? "true" : "false") + "}";
             response = ApiJson(
-                0, result.duplicate ? "Duplicate request ignored" : "Operation succeed",
+                result.busy ? 409 : 0, result.busy ? "Live control owns input" : result.duplicate ? "Duplicate request ignored" : "Operation succeed",
                 data);
         }
     }
@@ -2001,6 +2005,13 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
             ",\"silent_update\":true,"
             "\"auto_restart\":false}";
         SendResponse(fd, 200, ApiJson(0, "Operation succeed", data));
+    } else if (path == "/live_control") {
+        NSDictionary *info = @{@"protocol":@1, @"port":@46954,
+            @"deviceId":TVLiveDeviceIdentifier(), @"busy":@(TVExternalInputBlocked()),
+            @"display":TVLiveDisplayInfo()};
+        NSData *json = [NSJSONSerialization dataWithJSONObject:info options:0 error:nil];
+        SendResponse(fd, 200, ApiJson(0, "Operation succeed",
+            std::string(static_cast<const char *>(json.bytes), json.length)));
     } else if (path == "/deviceinfo") {
         SendResponse(fd, 200, DeviceInfoJson(port));
     } else if (path == "/snapshot") {
@@ -2029,7 +2040,7 @@ static void HandleClient(int fd, uint16_t port, sockaddr_in peer) {
             std::string data = "{\"run_id\":\"" + JsonEscape(result.runId) +
                 "\",\"duplicate\":" + (result.duplicate ? "true" : "false") + "}";
             SendResponse(fd, 200, ApiJson(
-                0, result.duplicate ? "Duplicate request ignored" : "Operation succeed",
+                result.busy ? 409 : 0, result.busy ? "Live control owns input" : result.duplicate ? "Duplicate request ignored" : "Operation succeed",
                 data));
         }
     } else if (path == "/recycle") {
@@ -2160,6 +2171,18 @@ static void RunDiscovery(uint16_t discoveryPort, uint16_t apiPort) {
 }
 
 }  // namespace
+
+bool TVAcquireLiveInput() {
+    std::lock_guard<std::mutex> lock(gSpawnMutex);
+    if (gRunning.load() || gLiveInput.load()) return false;
+    gLiveInput.store(true);
+    return true;
+}
+void TVReleaseLiveInput() { gLiveInput.store(false); }
+bool TVExternalInputBlocked() { return gLiveInput.load() || gRunning.load(); }
+NSString *TVLiveDeviceIdentifier() {
+    return UIDevice.currentDevice.identifierForVendor.UUIDString ?: @"";
+}
 
 void TVStartLuaAutomationServer(uint16_t port) {
     bool expected = false;

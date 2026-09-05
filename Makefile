@@ -1,4 +1,4 @@
-export PACKAGE_VERSION := 3.4-300
+export PACKAGE_VERSION := 3.5-320
 export THEOS_PACKAGE_SCHEME
 
 ifeq ($(THEOS_DEVICE_SIMULATOR),1)
@@ -47,6 +47,7 @@ trollvncserver_FILES += src/ScreenCapturer.mm
 trollvncserver_FILES += src/STHIDEventGenerator.mm
 trollvncserver_FILES += src/OhMyJetsam.mm
 trollvncserver_FILES += src/LuaAutomationServer.mm
+trollvncserver_FILES += src/LiveControlServer.mm
 trollvncserver_FILES += $(filter-out vendor/lua53/lua.c vendor/lua53/luac.c,$(wildcard vendor/lua53/*.c))
 
 trollvncserver_CFLAGS += -fobjc-arc

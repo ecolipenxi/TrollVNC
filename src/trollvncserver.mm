@@ -37,6 +37,7 @@
 #import <rfb/keysym.h>
 #import <rfb/rfb.h>
 #import <chrono>
+#include <cmath>
 #import <mutex>
 #import <string>
 #import <sys/socket.h>
@@ -55,6 +56,7 @@
 #import "STHIDEventGenerator.h"
 #import "ScreenCapturer.h"
 #import "LuaAutomationServer.h"
+#import "LiveControl.h"
 #import "TVFrameSnapshot.h"
 
 #define LocalizedString(key, comment, bundle, table)                                                                   \
@@ -3032,6 +3034,7 @@ NS_INLINE NSString *keysymToString(rfbKeySym ks) {
 }
 
 static void kbdAddEvent(rfbBool down, rfbKeySym keySym, rfbClientPtr cl) {
+    if (TVExternalInputBlocked()) return;
     (void)cl;
     if (gViewOnly)
         return;
@@ -3112,6 +3115,7 @@ static void kbdAddEvent(rfbBool down, rfbKeySym keySym, rfbClientPtr cl) {
 }
 
 static void kbdReleaseAllKeys(rfbClientPtr cl) {
+    if (TVExternalInputBlocked()) return;
     (void)cl;
     if (gViewOnly)
         return;
@@ -3222,7 +3226,7 @@ static void wheelScheduleFlush(rfbClientPtr cl, CGPoint anchorPoint, double dela
     rfbIncrClientRef(cl);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delaySec * NSEC_PER_SEC)), gWheelQueue, ^{
         TVClientState *st2 = tvGetClientState(cl);
-        if (!st2) {
+        if (!st2 || TVExternalInputBlocked()) {
             rfbDecrClientRef(cl);
             return;
         }
@@ -3303,7 +3307,7 @@ static void wheelScheduleFlush(rfbClientPtr cl, CGPoint anchorPoint, double dela
 }
 
 static void ptrAddEvent(int buttonMask, int x, int y, rfbClientPtr cl) {
-    if (gViewOnly)
+    if (gViewOnly || TVExternalInputBlocked())
         return;
 
     STHIDEventGenerator *gen = [STHIDEventGenerator sharedGenerator];
@@ -3375,6 +3379,67 @@ static void ptrAddEvent(int buttonMask, int x, int y, rfbClientPtr cl) {
 
     if (st)
         st->lastButtonMask = buttonMask;
+}
+
+// The live-control socket owns this state; all HID calls execute on the main queue.
+static bool liveFingerDown = false;
+static CGPoint livePoint = CGPointZero;
+static void liveOnMain(void (^block)(void)) {
+    if (NSThread.isMainThread) block();
+    else dispatch_sync(dispatch_get_main_queue(), block);
+}
+NSDictionary *TVLiveDisplayInfo() {
+    __block NSDictionary *result;
+    liveOnMain(^{
+        int rotation = ((gOrientationSyncEnabled ? gRotationQuad.load() : 0) + gOrientationFixQuad) & 3;
+        result = @{@"width":@(gWidth), @"height":@(gHeight), @"rotation":@(rotation), @"vncPort":@(gPort)};
+    });
+    return result;
+}
+void TVLiveResetInput() {
+    liveOnMain(^{
+        if (liveFingerDown) {
+            CGPoint point = livePoint;
+            [STHIDEventGenerator.sharedGenerator liftUpAtPoints:&point touchCount:1];
+            liveFingerDown = false;
+        }
+        [STHIDEventGenerator.sharedGenerator releaseEveryKeys];
+    });
+}
+bool TVLiveApplyEvent(NSDictionary *event) {
+    __block bool success = false;
+    liveOnMain(^{
+        NSString *type = event[@"type"];
+        STHIDEventGenerator *generator = STHIDEventGenerator.sharedGenerator;
+        if ([type isEqual:@"cancel"]) { TVLiveResetInput(); success = true; return; }
+        if ([type isEqual:@"key"]) {
+            TVLiveResetInput();
+            if ([event[@"key"] isEqual:@"home"]) { [generator menuPress]; success = true; }
+            else if ([event[@"key"] isEqual:@"power"]) { [generator powerPress]; success = true; }
+            return;
+        }
+        if (![type isEqual:@"down"] && ![type isEqual:@"move"] && ![type isEqual:@"up"]) return;
+        for (NSString *key in @[@"x", @"y", @"width", @"height", @"rotation"])
+            if (![event[key] isKindOfClass:NSNumber.class]) return;
+        double x = [event[@"x"] doubleValue], y = [event[@"y"] doubleValue];
+        int rotation = ((gOrientationSyncEnabled ? gRotationQuad.load() : 0) + gOrientationFixQuad) & 3;
+        if (!std::isfinite(x) || !std::isfinite(y) || x < 0 || x > 1 || y < 0 || y > 1 ||
+            [event[@"width"] intValue] != gWidth || [event[@"height"] intValue] != gHeight ||
+            [event[@"rotation"] intValue] != rotation) return;
+        CGPoint point = vncPointToDevicePoint((int)llround(x * (gWidth - 1)), (int)llround(y * (gHeight - 1)));
+        if ([type isEqual:@"down"]) {
+            if (liveFingerDown) return;
+            [generator touchDownAtPoints:&point touchCount:1]; liveFingerDown = true;
+        } else if ([type isEqual:@"move"]) {
+            if (!liveFingerDown) return;
+            [generator _updateTouchPoints:&point count:1];
+        } else {
+            if (!liveFingerDown) return;
+            [generator liftUpAtPoints:&point touchCount:1]; liveFingerDown = false;
+        }
+        livePoint = point; success = true;
+    });
+    return success;
 }
 
 #pragma mark - Bonjour (mDNS) Advertisement
@@ -5237,6 +5302,7 @@ int main(int argc, const char *argv[]) {
 
         tvStartControlSocketIfNeeded();
         TVStartLuaAutomationServer(46952);
+        TVStartLiveControlServer(46954);
     }
 
     CFRunLoopRun();
