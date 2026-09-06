@@ -5282,6 +5282,10 @@ int main(int argc, const char *argv[]) {
         setupOrientationObserver();
 
         setupRfbLogging();
+        // Lua OCR/image matching shares the framebuffer with VNC. Existing
+        // templates use native pixels; downscaling only the haystack breaks
+        // matching. Preserve native resolution until capture paths are split.
+        gScale = 1.0;
         setupRfbScreen(argc, argv);
         setupRfbEventHandlers();
         setupRfbClassicAuthentication();

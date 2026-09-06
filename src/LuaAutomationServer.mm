@@ -69,7 +69,7 @@ extern char **environ;
 
 namespace {
 
-constexpr char kLuaAgentVersion[] = "LuaAgent 3.2";
+constexpr char kLuaAgentVersion[] = "LuaAgent 3.2.1";
 std::atomic_bool gLiveInput{false};
 constexpr char kControllerAddressPath[] =
     "/var/mobile/Library/LuaAgent/controller-ip";
